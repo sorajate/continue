@@ -1,6 +1,5 @@
 import { streamResponse } from "@continuedev/fetch";
-import fetch from "node-fetch";
-import { OpenAI } from "openai/index.mjs";
+import { OpenAI } from "openai/index";
 import {
   ChatCompletion,
   ChatCompletionChunk,
@@ -12,8 +11,17 @@ import {
   CompletionCreateParamsStreaming,
   CreateEmbeddingResponse,
   EmbeddingCreateParams,
-} from "openai/resources/index.mjs";
-import { LlmApiConfig } from "../index.js";
+  Model,
+} from "openai/resources/index";
+
+import { GeminiConfig } from "../types.js";
+import {
+  chatChunk,
+  chatChunkFromDelta,
+  customFetch,
+  embedding,
+} from "../util.js";
+import { GeminiToolFunctionDeclaration } from "../util/gemini-types.js";
 import {
   BaseLlmApi,
   CreateRerankResponse,
@@ -26,11 +34,8 @@ export class GeminiApi implements BaseLlmApi {
 
   static maxStopSequences = 5;
 
-  constructor(protected config: LlmApiConfig) {
+  constructor(protected config: GeminiConfig) {
     this.apiBase = config.apiBase ?? this.apiBase;
-    if (!this.apiBase.endsWith("/")) {
-      this.apiBase += "/";
-    }
   }
 
   private _convertMessages(
@@ -45,16 +50,22 @@ export class GeminiApi implements BaseLlmApi {
   private _oaiPartToGeminiPart(
     part: OpenAI.Chat.Completions.ChatCompletionContentPart,
   ) {
-    return part.type === "text"
-      ? {
+    switch (part.type) {
+      case "text":
+        return {
           text: part.text,
-        }
-      : {
+        };
+      case "input_audio":
+        throw new Error("Unsupported part type: input_audio");
+      case "image_url":
+      default:
+        return {
           inlineData: {
             mimeType: "image/jpeg",
             data: part.image_url?.url.split(",")[1],
           },
         };
+    }
   }
 
   private _convertBody(oaiBody: ChatCompletionCreateParams, url: string) {
@@ -89,13 +100,14 @@ export class GeminiApi implements BaseLlmApi {
           parts:
             typeof msg.content === "string"
               ? [{ text: msg.content }]
-              : msg.content.map(this._oaiPartToGeminiPart),
+              : // @ts-ignore
+                msg.content.map(this._oaiPartToGeminiPart),
         };
       })
       .filter((c) => c !== null);
 
     const sysMsg = oaiBody.messages.find((msg) => msg.role === "system");
-    const finalBody = {
+    const finalBody: any = {
       generationConfig,
       contents,
       // if this.systemMessage is defined, reformat it for Gemini API
@@ -104,17 +116,105 @@ export class GeminiApi implements BaseLlmApi {
           systemInstruction: { parts: [{ text: sysMsg.content }] },
         }),
     };
+
+    if (!isV1API) {
+      // Convert and add tools if present
+      if (oaiBody.tools?.length) {
+        // Choosing to map all tools to the functionDeclarations of one tool
+        // Rather than map each tool to its own tool + functionDeclaration
+        // Same difference
+        const functions: GeminiToolFunctionDeclaration[] = [];
+        oaiBody.tools.forEach((tool) => {
+          if (tool.function.description && tool.function.name) {
+            const fn: GeminiToolFunctionDeclaration = {
+              description: tool.function.description,
+              name: tool.function.name,
+            };
+
+            if (
+              tool.function.parameters &&
+              "type" in tool.function.parameters
+              // && typeof tool.function.parameters.type === "string"
+            ) {
+              if (tool.function.parameters.type === "object") {
+                // Gemini can't take an empty object
+                // So if empty object param is present just don't add parameters
+                if (
+                  JSON.stringify(tool.function.parameters.properties) === "{}"
+                ) {
+                  functions.push(fn);
+                  return;
+                }
+              }
+              // Helper function to recursively clean JSON Schema objects
+              const cleanJsonSchema = (schema: any): any => {
+                if (!schema || typeof schema !== "object") return schema;
+
+                if (Array.isArray(schema)) {
+                  return schema.map(cleanJsonSchema);
+                }
+
+                const {
+                  $schema,
+                  additionalProperties,
+                  default: defaultValue,
+                  ...rest
+                } = schema;
+
+                // Recursively clean nested properties
+                if (rest.properties) {
+                  rest.properties = Object.entries(rest.properties).reduce(
+                    (acc, [key, value]) => ({
+                      ...acc,
+                      [key]: cleanJsonSchema(value),
+                    }),
+                    {},
+                  );
+                }
+
+                // Clean items in arrays
+                if (rest.items) {
+                  rest.items = cleanJsonSchema(rest.items);
+                }
+
+                return rest;
+              };
+
+              // Clean the parameters and convert type to uppercase
+              const cleanedParams = cleanJsonSchema(tool.function.parameters);
+              fn.parameters = {
+                ...cleanedParams,
+                type: (tool.function.parameters as any)?.type?.toUpperCase(),
+              };
+            }
+            functions.push(fn);
+          }
+        });
+        if (functions.length) {
+          finalBody.tools = [
+            {
+              functionDeclarations: functions,
+            },
+          ];
+        }
+      }
+    }
+
     return finalBody;
   }
 
   async chatCompletionNonStream(
     body: ChatCompletionCreateParamsNonStreaming,
+    signal: AbortSignal,
   ): Promise<ChatCompletion> {
     let completion = "";
-    for await (const chunk of this.chatCompletionStream({
-      ...body,
-      stream: true,
-    })) {
+    for await (const chunk of this.chatCompletionStream(
+      {
+        ...body,
+        stream: true,
+      },
+      signal,
+    )) {
       completion += chunk.choices[0].delta.content;
     }
     return {
@@ -130,6 +230,7 @@ export class GeminiApi implements BaseLlmApi {
           message: {
             role: "assistant",
             content: completion,
+            refusal: null,
           },
         },
       ],
@@ -139,14 +240,16 @@ export class GeminiApi implements BaseLlmApi {
 
   async *chatCompletionStream(
     body: ChatCompletionCreateParamsStreaming,
+    signal: AbortSignal,
   ): AsyncGenerator<ChatCompletionChunk> {
     const apiURL = new URL(
       `models/${body.model}:streamGenerateContent?key=${this.config.apiKey}`,
       this.apiBase,
     ).toString();
-    const resp = await fetch(apiURL, {
+    const resp = await customFetch(this.config.requestOptions)(apiURL, {
       method: "POST",
       body: JSON.stringify(this._convertBody(body, apiURL)),
+      signal,
     });
 
     let buffer = "";
@@ -177,28 +280,35 @@ export class GeminiApi implements BaseLlmApi {
         if (data.error) {
           throw new Error(data.error.message);
         }
-        // Check for existence of each level before accessing the final 'text' property
-        if (data?.candidates?.[0]?.content?.parts?.[0]?.text) {
-          yield {
-            id: "",
-            object: "chat.completion.chunk",
-            model: body.model,
-            created: Date.now(),
-            choices: [
-              {
-                index: 0,
-                logprobs: undefined,
-                finish_reason: null,
+
+        const content = data?.candidates?.[0]?.content;
+        if (content) {
+          for (const part of content.parts) {
+            if ("text" in part) {
+              yield chatChunk({
+                content: part.text,
+                model: body.model,
+              });
+            } else if ("functionCall" in part) {
+              yield chatChunkFromDelta({
+                model: body.model,
                 delta: {
-                  role: "assistant",
-                  content: data.candidates[0].content.parts[0].text,
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: "", // Not supported by Gemini
+                      type: "function",
+                      function: {
+                        name: part.functionCall.name,
+                        arguments: JSON.stringify(part.functionCall.args),
+                      },
+                    },
+                  ],
                 },
-              },
-            ],
-            usage: undefined,
-          };
+              });
+            }
+          }
         } else {
-          // Handle the case where the expected data structure is not found
           console.warn("Unexpected response format:", data);
         }
       }
@@ -230,7 +340,7 @@ export class GeminiApi implements BaseLlmApi {
 
   async embed(body: EmbeddingCreateParams): Promise<CreateEmbeddingResponse> {
     const inputs = Array.isArray(body.input) ? body.input : [body.input];
-    const response = await fetch(
+    const response = await customFetch(this.config.requestOptions)(
       new URL(`${body.model}:batchEmbedContents`, this.apiBase),
       {
         method: "POST",
@@ -253,18 +363,17 @@ export class GeminiApi implements BaseLlmApi {
     );
 
     const data = (await response.json()) as any;
-    return {
-      object: "list",
+    return embedding({
       model: body.model,
       usage: {
-        total_tokens: 0,
-        prompt_tokens: 0,
+        total_tokens: data.total_tokens,
+        prompt_tokens: data.prompt_tokens,
       },
-      data: data.embeddings.map((embedding: any, index: number) => ({
-        object: "embedding",
-        index,
-        embedding: embedding.values,
-      })),
-    };
+      data: data.batchEmbedContents.map((embedding: any) => embedding.values),
+    });
+  }
+
+  list(): Promise<Model[]> {
+    throw new Error("Method not implemented.");
   }
 }

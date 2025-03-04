@@ -1,14 +1,16 @@
 import crypto from "node:crypto";
 import * as fs from "node:fs";
+
 import plimit from "p-limit";
 import { open, type Database } from "sqlite";
 import sqlite3 from "sqlite3";
-import { IndexTag, IndexingProgressUpdate } from "../index.js";
+
+import { FileStatsMap, IndexTag, IndexingProgressUpdate } from "../index.js";
 import { getIndexSqlitePath } from "../util/paths.js";
+
 import {
   CodebaseIndex,
   IndexResultType,
-  LastModifiedMap,
   MarkCompleteCallback,
   PathAndCacheKey,
   RefreshIndexResults,
@@ -124,9 +126,12 @@ enum AddRemoveResultType {
   Compute = "compute",
 }
 
+// Don't attempt to index anything over 5MB
+const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024;
+
 async function getAddRemoveForTag(
   tag: IndexTag,
-  currentFiles: LastModifiedMap,
+  currentFiles: FileStatsMap,
   readFile: (path: string) => Promise<string>,
 ): Promise<
   [
@@ -139,6 +144,12 @@ async function getAddRemoveForTag(
   const newLastUpdatedTimestamp = Date.now();
   const files = { ...currentFiles };
 
+  for (const path in files) {
+    if (files[path].size > MAX_FILE_SIZE_BYTES) {
+      delete files[path];
+    }
+  }
+
   const saved = await getSavedItemsForTag(tag);
 
   const updateNewVersion: PathAndCacheKey[] = [];
@@ -146,32 +157,64 @@ async function getAddRemoveForTag(
   const remove: PathAndCacheKey[] = [];
   const updateLastUpdated: PathAndCacheKey[] = [];
 
-  for (const item of saved) {
-    const { lastUpdated, ...pathAndCacheKey } = item;
+  // First, group items by path and find latest timestamp for each
+  const pathGroups = new Map<string, {
+    latest: { lastUpdated: number, cacheKey: string },
+    allVersions: Array<{ cacheKey: string }>
+  }>();
 
-    if (files[item.path] === undefined) {
-      // Was indexed, but no longer exists. Remove
-      remove.push(pathAndCacheKey);
+  for (const item of saved) {
+    const { lastUpdated, path, cacheKey } = item;
+    
+    if (!pathGroups.has(path)) {
+      pathGroups.set(path, {
+        latest: { lastUpdated, cacheKey },
+        allVersions: [{ cacheKey }]
+      });
+    } else {
+      const group = pathGroups.get(path)!;
+      group.allVersions.push({ cacheKey });
+      if (lastUpdated > group.latest.lastUpdated) {
+        group.latest = { lastUpdated, cacheKey };
+      }
+    }
+  }
+
+  // Now process each unique path
+  for (const [path, group] of pathGroups) {
+    if (files[path] === undefined) {
+      // Was indexed, but no longer exists. Remove all versions
+      for (const version of group.allVersions) {
+        remove.push({ path, cacheKey: version.cacheKey });
+      }
     } else {
       // Exists in old and new, so determine whether it was updated
-      if (lastUpdated < files[item.path]) {
+      if (group.latest.lastUpdated < files[path].lastModified) {
         // Change was made after last update
-        const newHash = calculateHash(await readFile(pathAndCacheKey.path));
-        if (pathAndCacheKey.cacheKey !== newHash) {
+        const newHash = calculateHash(await readFile(path));
+        if (group.latest.cacheKey !== newHash) {
           updateNewVersion.push({
-            path: pathAndCacheKey.path,
+            path,
             cacheKey: newHash,
           });
-          updateOldVersion.push(pathAndCacheKey);
+          for (const version of group.allVersions) {
+            updateOldVersion.push({ path, cacheKey: version.cacheKey });
+          }
         } else {
-          updateLastUpdated.push(pathAndCacheKey);
+          // File contents did not change
+          updateLastUpdated.push({ path, cacheKey: group.latest.cacheKey });
+          for (const version of group.allVersions) {
+            if (version.cacheKey !== group.latest.cacheKey) {
+              updateOldVersion.push({ path, cacheKey: version.cacheKey });
+            }
+          }
         }
       } else {
         // Already updated, do nothing
       }
 
-      // Remove so we can check leftovers afterward
-      delete files[item.path];
+      // Remove path, so that only newly created paths remain
+      delete files[path];
     }
   }
 
@@ -342,7 +385,7 @@ function mapIndexResultTypeToAddRemoveResultType(
 
 export async function getComputeDeleteAddRemove(
   tag: IndexTag,
-  currentFiles: LastModifiedMap,
+  currentFiles: FileStatsMap,
   readFile: (path: string) => Promise<string>,
   repoName: string | undefined,
 ): Promise<[RefreshIndexResults, PathAndCacheKey[], MarkCompleteCallback]> {
@@ -416,11 +459,9 @@ export async function getComputeDeleteAddRemove(
 
 export class GlobalCacheCodeBaseIndex implements CodebaseIndex {
   relativeExpectedTime: number = 1;
-  private db: DatabaseConnection;
 
-  constructor(db: DatabaseConnection) {
-    this.db = db;
-  }
+  constructor(private db: DatabaseConnection) {}
+
   artifactId = "globalCache";
 
   static async create(): Promise<GlobalCacheCodeBaseIndex> {
@@ -470,4 +511,25 @@ export class GlobalCacheCodeBaseIndex implements CodebaseIndex {
       tag.artifactId,
     );
   }
+}
+
+const SQLITE_MAX_LIKE_PATTERN_LENGTH = 50000;
+
+export function truncateToLastNBytes(input: string, maxBytes: number): string {
+  let bytes = 0;
+  let startIndex = 0;
+
+  for (let i = input.length - 1; i >= 0; i--) {
+    bytes += new TextEncoder().encode(input[i]).length;
+    if (bytes > maxBytes) {
+      startIndex = i + 1;
+      break;
+    }
+  }
+
+  return input.substring(startIndex, input.length);
+}
+
+export function truncateSqliteLikePattern(input: string) {
+  return truncateToLastNBytes(input, SQLITE_MAX_LIKE_PATTERN_LENGTH);
 }

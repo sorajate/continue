@@ -9,7 +9,7 @@ class TelemetryService {
     private val POSTHOG_API_KEY = "phc_JS6XFROuNbhJtVCEdTSYk6gl5ArRrTNMpCcguAXlSPs"
     private var posthog: PostHog? = null;
     private var distinctId: String? = null;
-
+    
     fun setup(distinctId: String) {
         this.posthog = Builder(POSTHOG_API_KEY).host("https://app.posthog.com").build()
         this.distinctId = distinctId
@@ -19,7 +19,9 @@ class TelemetryService {
         if (this.posthog == null || this.distinctId == null) {
             return;
         }
-        this.posthog?.capture(this.distinctId, eventName, properties)
+        try {
+            this.posthog?.capture(this.distinctId, eventName, properties)
+        } catch (e: Exception) {}
     }
 
     fun shutdown() {

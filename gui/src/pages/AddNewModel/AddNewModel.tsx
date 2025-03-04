@@ -13,7 +13,7 @@ import ModelCard from "../../components/modelSelection/ModelCard";
 import Toggle from "../../components/modelSelection/Toggle";
 import { IdeMessengerContext } from "../../context/IdeMessenger";
 import { useNavigationListener } from "../../hooks/useNavigationListener";
-import { setDefaultModel } from "../../redux/slices/stateSlice";
+import { setDefaultModel } from "../../redux/slices/configSlice";
 import { ModelPackage, models } from "./configs/models";
 import { providers } from "./configs/providers";
 import { CustomModelButton } from "./ConfigureProvider";
@@ -39,7 +39,7 @@ const GridDiv = styled.div`
  */
 const modelsByProvider: Record<string, ModelPackage[]> = {
   "Open AI": [models.gpt4turbo, models.gpt4o, models.gpt35turbo],
-  Anthropic: [models.claude3Opus, models.claude3Sonnet, models.claude3Haiku],
+  Anthropic: [models.claude3Opus, models.claude3Sonnet, models.claude35Haiku],
   Mistral: [
     models.codestral,
     models.mistral7b,
@@ -49,7 +49,11 @@ const modelsByProvider: Record<string, ModelPackage[]> = {
     models.mistralLarge,
   ],
   Cohere: [models.commandR, models.commandRPlus],
-  DeepSeek: [models.deepseekCoderApi, models.deepseekChatApi],
+  DeepSeek: [
+    models.deepseekCoderApi,
+    models.deepseekChatApi,
+    models.deepseekReasonerApi,
+  ],
   Gemini: [models.geminiPro, models.gemini15Pro, models.gemini15Flash],
   "Open Source": [models.llama3Chat, models.mistralOs, models.deepseek],
 };
@@ -63,9 +67,9 @@ function AddNewModel() {
   const [providersSelected, setProvidersSelected] = React.useState(true);
 
   return (
-    <div className="overflow-y-scroll mb-6">
+    <div className="mb-6 overflow-y-scroll">
       <div
-        className="items-center flex m-0 p-0 sticky top-0"
+        className="sticky top-0 m-0 flex items-center p-0"
         style={{
           borderBottom: `0.5px solid ${lightGray}`,
           backgroundColor: vscBackground,
@@ -76,9 +80,9 @@ function AddNewModel() {
           width="1.2em"
           height="1.2em"
           onClick={() => navigate("/")}
-          className="inline-block ml-4 cursor-pointer"
+          className="ml-4 inline-block cursor-pointer"
         />
-        <h3 className="text-lg font-bold m-2 inline-block">Add a new model</h3>
+        <h3 className="m-2 inline-block text-lg font-bold">Add a new model</h3>
       </div>
       <br />
       <div className="px-6">
@@ -113,7 +117,7 @@ function AddNewModel() {
 
         {providersSelected ? (
           <>
-            <div className="text-center leading-relaxed col-span-full mb-8">
+            <div className="col-span-full mb-8 text-center leading-relaxed">
               <h2 className="mb-0">Providers</h2>
               <p className="mt-2">
                 Select a provider below, or configure your own in{" "}
@@ -122,27 +126,29 @@ function AddNewModel() {
             </div>
 
             <GridDiv>
-              {Object.entries(providers).map(([providerName, modelInfo], i) => (
-                <ModelCard
-                  key={`${providerName}-${i}`}
-                  title={modelInfo.title}
-                  description={modelInfo.description}
-                  tags={modelInfo.tags}
-                  icon={modelInfo.icon}
-                  refUrl={`https://docs.continue.dev/reference/Model%20Providers/${
-                    modelInfo.refPage || modelInfo.provider.toLowerCase()
-                  }`}
-                  onClick={(e) => {
-                    console.log(`/addModel/provider/${providerName}`);
-                    navigate(`/addModel/provider/${providerName}`);
-                  }}
-                />
-              ))}
+              {Object.entries(providers).map(([providerName, modelInfo], i) =>
+                modelInfo ? (
+                  <ModelCard
+                    key={`${providerName}-${i}`}
+                    title={modelInfo.title}
+                    description={modelInfo.description}
+                    tags={modelInfo.tags}
+                    icon={modelInfo.icon}
+                    refUrl={`https://docs.continue.dev/reference/Model%20Providers/${
+                      modelInfo.refPage || modelInfo.provider.toLowerCase()
+                    }`}
+                    onClick={(e) => {
+                      console.log(`/addModel/provider/${providerName}`);
+                      navigate(`/addModel/provider/${providerName}`);
+                    }}
+                  />
+                ) : null,
+              )}
             </GridDiv>
           </>
         ) : (
           <>
-            <div className="text-center leading-relaxed col-span-full">
+            <div className="col-span-full text-center leading-relaxed">
               <h2 className="mb-0">Models</h2>
               <p className="mt-2">
                 Select a model from the most popular options below, or configure
@@ -152,8 +158,8 @@ function AddNewModel() {
 
             {Object.entries(modelsByProvider).map(
               ([providerTitle, modelConfigsByProviderTitle]) => (
-                <div className="flex flex-col mb-6">
-                  <div className="w-full items-center mb-4">
+                <div className="mb-6 flex flex-col">
+                  <div className="mb-4 w-full items-center">
                     <h3 className="">{providerTitle}</h3>
                     <hr
                       style={{
@@ -176,6 +182,9 @@ function AddNewModel() {
                         dimensions={config.dimensions}
                         providerOptions={config.providerOptions}
                         onClick={(e, dimensionChoices, selectedProvider) => {
+                          if (!selectedProvider) {
+                            return;
+                          }
                           const model = {
                             ...config.params,
                             ..._.merge(
@@ -187,7 +196,7 @@ function AddNewModel() {
                                 };
                               }) || []),
                             ),
-                            provider: providers[selectedProvider].provider,
+                            provider: providers[selectedProvider]?.provider,
                           };
                           ideMessenger.post("config/addModel", { model });
                           dispatch(
@@ -211,11 +220,13 @@ function AddNewModel() {
           className="mt-12"
           disabled={false}
           onClick={(e) => {
-            ideMessenger.post("openConfigJson", undefined);
+            ideMessenger.post("config/openProfile", {
+              profileId: "local",
+            });
           }}
         >
-          <h3 className="text-center my-2">
-            <Cog6ToothIcon className="inline-block h-5 w-5 align-middle px-4" />
+          <h3 className="my-2 text-center">
+            <Cog6ToothIcon className="inline-block h-5 w-5 px-4 align-middle" />
             Open config.json
           </h3>
         </CustomModelButton>

@@ -1,4 +1,25 @@
 import Parser from "web-tree-sitter";
+
+import { migrate } from "../util/paths";
+import {
+  getFullLanguageName,
+  getParserForFile,
+  getQueryForFile,
+} from "../util/treeSitter";
+
+import {
+  DatabaseConnection,
+  SqliteDb,
+  tagToString,
+  truncateSqliteLikePattern,
+} from "./refreshIndex";
+import {
+  IndexResultType,
+  MarkCompleteCallback,
+  RefreshIndexResults,
+  type CodebaseIndex,
+} from "./types";
+
 import type {
   ChunkWithoutID,
   ContextItem,
@@ -7,20 +28,12 @@ import type {
   IndexTag,
   IndexingProgressUpdate,
 } from "../";
-import { getBasename, getLastNPathParts } from "../util/";
-import { migrate } from "../util/paths";
 import {
-  TSQueryType,
-  getParserForFile,
-  getQueryForFile,
-} from "../util/treeSitter";
-import { DatabaseConnection, SqliteDb, tagToString } from "./refreshIndex";
-import {
-  IndexResultType,
-  MarkCompleteCallback,
-  RefreshIndexResults,
-  type CodebaseIndex,
-} from "./types";
+  findUriInDirs,
+  getLastNPathParts,
+  getLastNUriRelativePathParts,
+  getUriPathBasename,
+} from "../util/uri";
 
 type SnippetChunk = ChunkWithoutID & { title: string; signature: string };
 
@@ -180,7 +193,15 @@ export class CodeSnippetsCodebaseIndex implements CodebaseIndex {
     }
 
     const ast = parser.parse(contents);
-    const query = await getQueryForFile(filepath, TSQueryType.CodeSnippets);
+
+    const language = getFullLanguageName(filepath);
+    if (!language) {
+      return [];
+    }
+    const query = await getQueryForFile(
+      filepath,
+      `code-snippet-queries/${language}.scm`,
+    );
     const matches = query?.matches(ast.rootNode);
 
     if (!matches) {
@@ -212,7 +233,6 @@ export class CodeSnippetsCodebaseIndex implements CodebaseIndex {
         );
       } catch (e) {
         // If can't parse, assume malformatted code
-        console.error(`Error parsing ${compute.path}:`, e);
       }
 
       // Add snippets to sqlite
@@ -237,7 +257,7 @@ export class CodeSnippetsCodebaseIndex implements CodebaseIndex {
       }
 
       yield {
-        desc: `Indexing ${getBasename(compute.path)}`,
+        desc: `Indexing ${getUriPathBasename(compute.path)}`,
         progress: i / results.compute.length,
         status: "indexing",
       };
@@ -277,7 +297,6 @@ export class CodeSnippetsCodebaseIndex implements CodebaseIndex {
         );
       } catch (e) {
         // If can't parse, assume malformatted code
-        console.error(`Error parsing ${addTag.path}:`, e);
       }
 
       for (const snippet of snippets) {
@@ -333,14 +352,23 @@ export class CodeSnippetsCodebaseIndex implements CodebaseIndex {
     }
   }
 
-  static async getForId(id: number): Promise<ContextItem> {
+  static async getForId(
+    id: number,
+    workspaceDirs: string[],
+  ): Promise<ContextItem> {
     const db = await SqliteDb.get();
     const row = await db.get("SELECT * FROM code_snippets WHERE id = ?", [id]);
 
+    const last2Parts = getLastNUriRelativePathParts(workspaceDirs, row.path, 2);
+    const { relativePathOrBasename } = findUriInDirs(row.path, workspaceDirs);
     return {
       name: row.title,
-      description: getLastNPathParts(row.path, 2),
-      content: `\`\`\`${getBasename(row.path)}\n${row.content}\n\`\`\``,
+      description: last2Parts,
+      content: `\`\`\`${relativePathOrBasename}\n${row.content}\n\`\`\``,
+      uri: {
+        type: "file",
+        value: row.path,
+      },
     };
   }
 
@@ -373,38 +401,38 @@ export class CodeSnippetsCodebaseIndex implements CodebaseIndex {
     offset: number = 0,
     batchSize: number = 100,
   ): Promise<{
-    groupedByPath: { [path: string]: string[] };
+    groupedByUri: { [path: string]: string[] };
     hasMore: boolean;
   }> {
     const db = await SqliteDb.get();
     await CodeSnippetsCodebaseIndex._createTables(db);
 
-    const likePatterns = workspaceDirs.map((dir) => `${dir}%`);
+    const likePatterns = workspaceDirs.map((dir) =>
+      truncateSqliteLikePattern(`${dir}%`),
+    );
     const placeholders = likePatterns.map(() => "?").join(" OR path LIKE ");
 
     const query = `
-  SELECT path, signature
-  FROM code_snippets
-  WHERE path LIKE ${placeholders}
-  ORDER BY path
-  LIMIT ? OFFSET ?
-`;
+    SELECT DISTINCT path, signature
+    FROM code_snippets
+    WHERE path LIKE ${placeholders}
+    ORDER BY path, signature
+    LIMIT ? OFFSET ?
+  `;
 
     const rows = await db.all(query, [...likePatterns, batchSize, offset]);
 
-    const validRows = rows.filter((row) => row.path && row.signature !== null);
+    const groupedByUri: { [path: string]: string[] } = {};
 
-    const groupedByPath: { [path: string]: string[] } = {};
-
-    for (const { path, signature } of validRows) {
-      if (!groupedByPath[path]) {
-        groupedByPath[path] = [];
+    for (const { path, signature } of rows) {
+      if (!groupedByUri[path]) {
+        groupedByUri[path] = [];
       }
-      groupedByPath[path].push(signature);
+      groupedByUri[path].push(signature);
     }
 
     const hasMore = rows.length === batchSize;
 
-    return { groupedByPath, hasMore };
+    return { groupedByUri, hasMore };
   }
 }

@@ -1,6 +1,11 @@
-import { Analytics } from "@continuedev/config-types";
 import net from "node:net";
-import { IAnalyticsProvider } from "./IAnalyticsProvider.js";
+
+import { Analytics } from "@continuedev/config-types";
+
+import {
+  ControlPlaneProxyInfo,
+  IAnalyticsProvider,
+} from "./IAnalyticsProvider.js";
 
 export default class LogStashAnalyticsProvider implements IAnalyticsProvider {
   private host?: string;
@@ -31,7 +36,7 @@ export default class LogStashAnalyticsProvider implements IAnalyticsProvider {
   async setup(
     config: Analytics,
     uniqueId: string,
-    workspaceId?: string,
+    controlPlaneProxyInfo?: ControlPlaneProxyInfo,
   ): Promise<void> {
     if (!config.url) {
       console.warn("LogStashAnalyticsProvider is missing a URL");

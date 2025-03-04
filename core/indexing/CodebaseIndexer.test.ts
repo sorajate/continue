@@ -1,21 +1,25 @@
 import { jest } from "@jest/globals";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
-import path from "node:path";
+import path from "path";
+
 import { ContinueServerClient } from "../continueServer/stubs/client.js";
-import { testConfigHandler, testIde } from "../test/util/fixtures.js";
+import { testConfigHandler, testIde } from "../test/fixtures.js";
 import {
   addToTestDir,
   setUpTestDir,
   tearDownTestDir,
   TEST_DIR,
-} from "../test/util/testDir.js";
+  TEST_DIR_PATH,
+} from "../test/testDir.js";
 import { getIndexSqlitePath } from "../util/paths.js";
+
 import { CodebaseIndexer, PauseToken } from "./CodebaseIndexer.js";
 import { getComputeDeleteAddRemove } from "./refreshIndex.js";
 import { TestCodebaseIndex } from "./TestCodebaseIndex.js";
 import { CodebaseIndex } from "./types.js";
 import { walkDir } from "./walkDir.js";
+import { localPathToUri } from "../util/pathToUri.js";
 
 jest.useFakeTimers();
 
@@ -72,9 +76,11 @@ describe("CodebaseIndexer", () => {
     tearDownTestDir();
     setUpTestDir();
 
-    execSync("git init", { cwd: TEST_DIR });
-    execSync('git config user.email "test@example.com"', { cwd: TEST_DIR });
-    execSync('git config user.name "Test"', { cwd: TEST_DIR });
+    execSync("git init", { cwd: TEST_DIR_PATH });
+    execSync('git config user.email "test@example.com"', {
+      cwd: TEST_DIR_PATH,
+    });
+    execSync('git config user.name "Test"', { cwd: TEST_DIR_PATH });
   });
 
   afterAll(async () => {
@@ -86,10 +92,18 @@ describe("CodebaseIndexer", () => {
     const abortSignal = abortController.signal;
 
     const updates = [];
-    for await (const update of codebaseIndexer.refresh(
+    for await (const update of codebaseIndexer.refreshDirs(
       [TEST_DIR],
       abortSignal,
     )) {
+      updates.push(update);
+    }
+    return updates;
+  }
+
+  async function refreshIndexFiles(files: string[]) {
+    const updates = [];
+    for await (const update of codebaseIndexer.refreshFiles(files)) {
       updates.push(update);
     }
     return updates;
@@ -105,7 +119,7 @@ describe("CodebaseIndexer", () => {
   async function getIndexPlan() {
     const workspaceFiles = await walkDir(TEST_DIR, testIde);
     const [tag] = await testIde.getTags(testIndex.artifactId);
-    const stats = await testIde.getLastModified(workspaceFiles);
+    const stats = await testIde.getFileStats(workspaceFiles);
 
     const [results, lastUpdated, markComplete] =
       await getComputeDeleteAddRemove(
@@ -124,7 +138,6 @@ describe("CodebaseIndexer", () => {
     del: number,
   ) {
     const plan = await getIndexPlan();
-    console.log("PLAN: ", plan);
     expect(plan.compute).toHaveLength(compute);
     expect(plan.addTag).toHaveLength(addTag);
     expect(plan.removeTag).toHaveLength(removeTag);
@@ -145,7 +158,10 @@ describe("CodebaseIndexer", () => {
   });
 
   test("should have created index folder with all necessary files", async () => {
-    expect(fs.existsSync(getIndexSqlitePath())).toBe(true);
+    const exists = await testIde.fileExists(
+      localPathToUri(getIndexSqlitePath()),
+    );
+    expect(exists).toBe(true);
   });
 
   test("should have indexed all of the files", async () => {
@@ -153,6 +169,15 @@ describe("CodebaseIndexer", () => {
     expect(indexed.length).toBe(2);
     expect(indexed.some((file) => file.endsWith("test.ts"))).toBe(true);
     expect(indexed.some((file) => file.endsWith("main.py"))).toBe(true);
+  });
+
+  test("should successfuly re-index specific files", async () => {
+    // Could add more specific tests for this but uses similar logic
+    const before = await getAllIndexedFiles();
+    await refreshIndexFiles(before);
+
+    const after = await getAllIndexedFiles();
+    expect(after.length).toBe(before.length);
   });
 
   test("should successfully re-index after adding a file", async () => {
@@ -170,7 +195,7 @@ describe("CodebaseIndexer", () => {
   });
 
   test("should successfully re-index after deleting a file", async () => {
-    fs.rmSync(path.join(TEST_DIR, "main.rs"));
+    fs.rmSync(path.join(TEST_DIR_PATH, "main.rs"));
 
     await expectPlan(0, 0, 0, 1);
 
@@ -191,23 +216,25 @@ describe("CodebaseIndexer", () => {
 
   test("should create git repo for testing", async () => {
     execSync(
-      `cd ${TEST_DIR} && git init && git checkout -b main && git add -A && git commit -m "First commit"`,
+      `cd ${TEST_DIR_PATH} && git init && git checkout -b main && git add -A && git commit -m "First commit"`,
     );
   });
 
   test.skip("should only re-index the changed files when changing branches", async () => {
-    execSync(`cd ${TEST_DIR} && git checkout -b test2`);
+    execSync(`cd ${TEST_DIR_PATH} && git checkout -b test2`);
     // Rewriting the file
     addToTestDir([["test.ts", "// This is different"]]);
 
     // Should re-compute test.ts, but just re-tag the .py file
     await expectPlan(1, 1, 0, 0);
 
-    execSync(`cd ${TEST_DIR} && git add -A && git commit -m "Change .ts file"`);
+    execSync(
+      `cd ${TEST_DIR_PATH} && git add -A && git commit -m "Change .ts file"`,
+    );
   });
 
   test.skip("shouldn't re-index anything when changing back to original branch", async () => {
-    execSync(`cd ${TEST_DIR} && git checkout main`);
+    execSync(`cd ${TEST_DIR_PATH} && git checkout main`);
     await expectPlan(0, 0, 0, 0);
   });
 });

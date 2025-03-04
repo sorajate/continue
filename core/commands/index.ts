@@ -1,6 +1,7 @@
 import { CustomCommand, SlashCommand, SlashCommandDescription } from "../";
-import { stripImages } from "../llm/images";
-import { renderTemplatedString } from "../promptFiles/renderTemplatedString";
+import { renderTemplatedString } from "../promptFiles/v1/renderTemplatedString";
+import { renderChatMessage } from "../util/messageContent";
+
 import SlashCommands from "./slash";
 
 export function slashFromCustomCommand(
@@ -8,8 +9,8 @@ export function slashFromCustomCommand(
 ): SlashCommand {
   return {
     name: customCommand.name,
-    description: customCommand.description,
-    run: async function* ({ input, llm, history, ide }) {
+    description: customCommand.description ?? "",
+    run: async function* ({ input, llm, history, ide, completionOptions }) {
       // Remove slash command prefix from input
       let userInput = input;
       if (userInput.startsWith(`/${customCommand.name}`)) {
@@ -19,32 +20,43 @@ export function slashFromCustomCommand(
       }
 
       // Render prompt template
-      const promptUserInput = await renderTemplatedString(
-        customCommand.prompt,
-        ide.readFile.bind(ide),
-        { input: userInput },
-      );
+      let promptUserInput: string;
+      if (customCommand.prompt.includes("{{{ input }}}")) {
+        promptUserInput = await renderTemplatedString(
+          customCommand.prompt,
+          ide.readFile.bind(ide),
+          { input: userInput },
+        );
+      } else {
+        promptUserInput = customCommand.prompt + "\n\n" + userInput;
+      }
 
       const messages = [...history];
       // Find the last chat message with this slash command and replace it with the user input
       for (let i = messages.length - 1; i >= 0; i--) {
-        const { role, content } = messages[i];
+        const message = messages[i];
+        const { role, content } = message;
         if (role !== "user") {
           continue;
         }
 
         if (
           Array.isArray(content) &&
-          content.some((part) =>
-            part.text?.startsWith(`/${customCommand.name}`),
+          content.some(
+            (part) =>
+              "text" in part && part.text?.startsWith(`/${customCommand.name}`),
           )
         ) {
           messages[i] = {
-            ...messages[i],
+            ...message,
             content: content.map((part) => {
-              return part.text?.startsWith(`/${customCommand.name}`)
-                ? { ...part, text: promptUserInput }
-                : part;
+              if (
+                "text" in part &&
+                part.text.startsWith(`/${customCommand.name}`)
+              ) {
+                return { type: "text", text: promptUserInput };
+              }
+              return part;
             }),
           };
           break;
@@ -52,13 +64,17 @@ export function slashFromCustomCommand(
           typeof content === "string" &&
           content.startsWith(`/${customCommand.name}`)
         ) {
-          messages[i] = { ...messages[i], content: promptUserInput };
+          messages[i] = { ...message, content: promptUserInput };
           break;
         }
       }
 
-      for await (const chunk of llm.streamChat(messages)) {
-        yield stripImages(chunk.content);
+      for await (const chunk of llm.streamChat(
+        messages,
+        new AbortController().signal,
+        completionOptions,
+      )) {
+        yield renderChatMessage(chunk);
       }
     },
   };

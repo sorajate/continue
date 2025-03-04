@@ -1,5 +1,5 @@
 import type { ToWebviewProtocol } from "core/protocol/index.js";
-import { Message } from "core/util/messenger";
+import { Message } from "core/protocol/messenger";
 import { useContext, useEffect } from "react";
 import { IdeMessengerContext } from "../context/IdeMessenger";
 
@@ -13,10 +13,10 @@ export function useWebviewListener<T extends keyof ToWebviewProtocol>(
 
   useEffect(
     () => {
-      let listener;
+      let listener: (event: { data: Message<ToWebviewProtocol[T][0]>}) => Promise<void>;
 
       if (!skip) {
-        listener = async (event: { data: Message }) => {
+        listener = async (event) => {
           if (event.data.messageType === messageType) {
             const result = await handler(event.data.data);
             ideMessenger.respond(messageType, result, event.data.messageId);
@@ -32,6 +32,6 @@ export function useWebviewListener<T extends keyof ToWebviewProtocol>(
         }
       };
     },
-    dependencies ? [...dependencies, skip] : [skip],
+    dependencies ? [...dependencies, skip, ideMessenger] : [skip, ideMessenger],
   );
 }

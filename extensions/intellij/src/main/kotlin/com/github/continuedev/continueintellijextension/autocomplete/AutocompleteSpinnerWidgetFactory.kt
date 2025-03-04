@@ -1,5 +1,6 @@
 package com.github.continuedev.continueintellijextension.autocomplete
 
+import com.github.continuedev.continueintellijextension.activities.ContinuePluginDisposable
 import com.github.continuedev.continueintellijextension.services.ContinueExtensionSettings
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.components.service
@@ -17,23 +18,15 @@ import java.awt.event.MouseEvent
 import javax.swing.Icon
 import javax.swing.JLabel
 
-class AutocompleteSpinnerWidget(project: Project): EditorBasedWidget(project), StatusBarWidget.IconPresentation, Disposable {
+class AutocompleteSpinnerWidget(project: Project) : EditorBasedWidget(project), StatusBarWidget.IconPresentation,
+    Disposable {
     private val iconLabel = JLabel()
     private var isLoading = false
-
-    private val animatedIcon = AnimatedIcon(
-            100,
-            IconLoader.getIcon("/icons/AnimationLoadingIcon/AnimationLoading1(RiderLight).svg", javaClass),
-            IconLoader.getIcon("/icons/AnimationLoadingIcon/AnimationLoading2(RiderLight).svg", javaClass),
-            IconLoader.getIcon("/icons/AnimationLoadingIcon/AnimationLoading3(RiderLight).svg", javaClass),
-            IconLoader.getIcon("/icons/AnimationLoadingIcon/AnimationLoading4(RiderLight).svg", javaClass),
-            IconLoader.getIcon("/icons/AnimationLoadingIcon/AnimationLoading5(RiderLight).svg", javaClass),
-            IconLoader.getIcon("/icons/AnimationLoadingIcon/AnimationLoading6(RiderLight).svg", javaClass),
-            IconLoader.getIcon("/icons/AnimationLoadingIcon/AnimationLoading7(RiderLight).svg", javaClass),
-            IconLoader.getIcon("/icons/AnimationLoadingIcon/AnimationLoading8(RiderLight).svg", javaClass),
-    )
+    
+    private val animatedIcon = AnimatedIcon.Default()
 
     init {
+        Disposer.register(ContinuePluginDisposable.getInstance(project), this)
         updateIcon()
     }
 
@@ -44,12 +37,12 @@ class AutocompleteSpinnerWidget(project: Project): EditorBasedWidget(project), S
     override fun dispose() {}
 
     override fun ID(): String {
-        return "AutocompleteSpinnerWidget"
+        return ID
     }
 
-    override fun getTooltipText(): String? {
+    override fun getTooltipText(): String {
         val enabled = service<ContinueExtensionSettings>().state.enableTabAutocomplete
-        return if (enabled) "Continue Autocomplete Enabled" else "Continue Autocomplete Disabled"
+        return if (enabled) "Continue autocomplete enabled" else "Continue autocomplete disabled"
     }
 
     override fun getClickConsumer(): Consumer<MouseEvent>? {
@@ -70,25 +63,29 @@ class AutocompleteSpinnerWidget(project: Project): EditorBasedWidget(project), S
 
         // Update the widget
         val statusBar = WindowManager.getInstance().getStatusBar(project)
-        statusBar.updateWidget(ID())
+        statusBar?.updateWidget(ID())
     }
 
     override fun install(statusBar: StatusBar) {
         updateIcon()
     }
 
-    override fun getPresentation(): StatusBarWidget.WidgetPresentation? {
+    override fun getPresentation(): StatusBarWidget.WidgetPresentation {
         return this
+    }
+
+    companion object {
+        const val ID = "AutocompleteSpinnerWidget"
     }
 }
 
-class AutocompleteSpinnerWidgetFactory: StatusBarWidgetFactory {
+class AutocompleteSpinnerWidgetFactory : StatusBarWidgetFactory {
     fun create(project: Project): AutocompleteSpinnerWidget {
         return AutocompleteSpinnerWidget(project)
     }
 
     override fun getId(): String {
-        return "AutocompleteSpinnerWidget"
+        return AutocompleteSpinnerWidget.ID
     }
 
     override fun getDisplayName(): String {
@@ -100,7 +97,7 @@ class AutocompleteSpinnerWidgetFactory: StatusBarWidgetFactory {
     }
 
     override fun createWidget(project: Project): StatusBarWidget {
-        return AutocompleteSpinnerWidget(project)
+        return create(project)
     }
 
     override fun disposeWidget(p0: StatusBarWidget) {

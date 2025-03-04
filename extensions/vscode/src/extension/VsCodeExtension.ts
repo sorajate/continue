@@ -1,12 +1,19 @@
+import fs from "fs";
+
 import { IContextProvider } from "core";
 import { ConfigHandler } from "core/config/ConfigHandler";
+import { EXTENSION_NAME, getControlPlaneEnv } from "core/control-plane/env";
 import { Core } from "core/core";
 import { FromCoreProtocol, ToCoreProtocol } from "core/protocol";
-import { InProcessMessenger } from "core/util/messenger";
-import { getConfigJsonPath, getConfigTsPath } from "core/util/paths";
-import fs from "fs";
+import { InProcessMessenger } from "core/protocol/messenger";
+import {
+  getConfigJsonPath,
+  getConfigTsPath,
+  getConfigYamlPath,
+} from "core/util/paths";
 import { v4 as uuidv4 } from "uuid";
 import * as vscode from "vscode";
+
 import { ContinueCompletionProvider } from "../autocomplete/completionProvider";
 import {
   monitorBatteryChanges,
@@ -15,9 +22,10 @@ import {
 } from "../autocomplete/statusBar";
 import { registerAllCommands } from "../commands";
 import { ContinueGUIWebviewViewProvider } from "../ContinueGUIWebviewViewProvider";
-import { DiffManager } from "../diff/horizontal";
-import { VerticalPerLineDiffManager } from "../diff/verticalPerLine/manager";
+import { VerticalDiffManager } from "../diff/vertical/manager";
 import { registerAllCodeLensProviders } from "../lang-server/codeLens";
+import { registerAllPromptFilesCompletionProviders } from "../lang-server/promptFileCompletions";
+import EditDecorationManager from "../quickEdit/EditDecorationManager";
 import { QuickEdit } from "../quickEdit/QuickEditQuickPick";
 import { setupRemoteConfigSync } from "../stubs/activation";
 import {
@@ -25,10 +33,12 @@ import {
   WorkOsAuthProvider,
 } from "../stubs/WorkOsAuthProvider";
 import { Battery } from "../util/battery";
-import { TabAutocompleteModel } from "../util/loadAutocompleteModel";
+import { FileSearch } from "../util/FileSearch";
 import { VsCodeIde } from "../VsCodeIde";
-import type { VsCodeWebviewProtocol } from "../webviewProtocol";
+
 import { VsCodeMessenger } from "./VsCodeMessenger";
+
+import type { VsCodeWebviewProtocol } from "../webviewProtocol";
 
 export class VsCodeExtension {
   // Currently some of these are public so they can be used in testing (test/test-suites)
@@ -36,21 +46,23 @@ export class VsCodeExtension {
   private configHandler: ConfigHandler;
   private extensionContext: vscode.ExtensionContext;
   private ide: VsCodeIde;
-  private tabAutocompleteModel: TabAutocompleteModel;
   private sidebar: ContinueGUIWebviewViewProvider;
   private windowId: string;
-  private diffManager: DiffManager;
-  private verticalDiffManager: VerticalPerLineDiffManager;
+  private editDecorationManager: EditDecorationManager;
+  private verticalDiffManager: VerticalDiffManager;
   webviewProtocolPromise: Promise<VsCodeWebviewProtocol>;
   private core: Core;
   private battery: Battery;
   private workOsAuthProvider: WorkOsAuthProvider;
+  private fileSearch: FileSearch;
 
   constructor(context: vscode.ExtensionContext) {
     // Register auth provider
     this.workOsAuthProvider = new WorkOsAuthProvider(context);
-    this.workOsAuthProvider.initialize();
+    this.workOsAuthProvider.refreshSessions();
     context.subscriptions.push(this.workOsAuthProvider);
+
+    this.editDecorationManager = new EditDecorationManager(context);
 
     let resolveWebviewProtocol: any = undefined;
     this.webviewProtocolPromise = new Promise<VsCodeWebviewProtocol>(
@@ -58,14 +70,13 @@ export class VsCodeExtension {
         resolveWebviewProtocol = resolve;
       },
     );
-    this.diffManager = new DiffManager(context);
-    this.ide = new VsCodeIde(this.diffManager, this.webviewProtocolPromise);
+    this.ide = new VsCodeIde(this.webviewProtocolPromise, context);
     this.extensionContext = context;
     this.windowId = uuidv4();
 
     // Dependencies of core
     let resolveVerticalDiffManager: any = undefined;
-    const verticalDiffManagerPromise = new Promise<VerticalPerLineDiffManager>(
+    const verticalDiffManagerPromise = new Promise<VerticalDiffManager>(
       (resolve) => {
         resolveVerticalDiffManager = resolve;
       },
@@ -108,6 +119,7 @@ export class VsCodeExtension {
       verticalDiffManagerPromise,
       configHandlerPromise,
       this.workOsAuthProvider,
+      this.editDecorationManager,
     );
 
     this.core = new Core(inProcessMessenger, this.ide, async (log: string) => {
@@ -122,25 +134,22 @@ export class VsCodeExtension {
     this.configHandler = this.core.configHandler;
     resolveConfigHandler?.(this.configHandler);
 
-    this.configHandler.reloadConfig();
-    this.verticalDiffManager = new VerticalPerLineDiffManager(
+    this.configHandler.loadConfig();
+    this.verticalDiffManager = new VerticalDiffManager(
       this.configHandler,
+      this.sidebar.webviewProtocol,
+      this.editDecorationManager,
     );
     resolveVerticalDiffManager?.(this.verticalDiffManager);
-    this.tabAutocompleteModel = new TabAutocompleteModel(this.configHandler);
 
     setupRemoteConfigSync(
       this.configHandler.reloadConfig.bind(this.configHandler),
     );
 
-    // Indexing + pause token
-    this.diffManager.webviewProtocol = this.sidebar.webviewProtocol;
-
-    this.configHandler.loadConfig().then((config) => {
+    this.configHandler.loadConfig().then(({ config }) => {
       const { verticalDiffCodeLens } = registerAllCodeLensProviders(
         context,
-        this.diffManager,
-        this.verticalDiffManager.filepathToCodeLens,
+        this.verticalDiffManager.fileUriToCodeLens,
         config,
       );
 
@@ -148,21 +157,25 @@ export class VsCodeExtension {
         verticalDiffCodeLens.refresh.bind(verticalDiffCodeLens);
     });
 
-    this.configHandler.onConfigUpdate((newConfig) => {
-      this.sidebar.webviewProtocol?.request("configUpdate", undefined);
+    this.configHandler.onConfigUpdate(
+      async ({ config: newConfig, errors, configLoadInterrupted }) => {
+        if (configLoadInterrupted) {
+          // Show error in status bar
+          setupStatusBar(undefined, undefined, true);
+        } else if (newConfig) {
+          setupStatusBar(undefined, undefined, false);
 
-      this.tabAutocompleteModel.clearLlm();
-
-      registerAllCodeLensProviders(
-        context,
-        this.diffManager,
-        this.verticalDiffManager.filepathToCodeLens,
-        newConfig,
-      );
-    });
+          registerAllCodeLensProviders(
+            context,
+            this.verticalDiffManager.fileUriToCodeLens,
+            newConfig,
+          );
+        }
+      },
+    );
 
     // Tab autocomplete
-    const config = vscode.workspace.getConfiguration("continue");
+    const config = vscode.workspace.getConfiguration(EXTENSION_NAME);
     const enabled = config.get<boolean>("enableTabAutocomplete");
 
     // Register inline completion provider
@@ -175,7 +188,6 @@ export class VsCodeExtension {
         new ContinueCompletionProvider(
           this.configHandler,
           this.ide,
-          this.tabAutocompleteModel,
           this.sidebar.webviewProtocol,
         ),
       ),
@@ -186,12 +198,21 @@ export class VsCodeExtension {
     context.subscriptions.push(this.battery);
     context.subscriptions.push(monitorBatteryChanges(this.battery));
 
+    // FileSearch
+    this.fileSearch = new FileSearch(this.ide);
+    registerAllPromptFilesCompletionProviders(
+      context,
+      this.fileSearch,
+      this.ide,
+    );
+
     const quickEdit = new QuickEdit(
       this.verticalDiffManager,
       this.configHandler,
       this.sidebar.webviewProtocol,
       this.ide,
       context,
+      this.fileSearch,
     );
 
     // Commands
@@ -201,12 +222,12 @@ export class VsCodeExtension {
       context,
       this.sidebar,
       this.configHandler,
-      this.diffManager,
       this.verticalDiffManager,
       this.core.continueServerClientPromise,
       this.battery,
       quickEdit,
       this.core,
+      this.editDecorationManager,
     );
 
     // Disabled due to performance issues
@@ -215,76 +236,88 @@ export class VsCodeExtension {
     // Listen for file saving - use global file watcher so that changes
     // from outside the window are also caught
     fs.watchFile(getConfigJsonPath(), { interval: 1000 }, async (stats) => {
+      if (stats.size === 0) {
+        return;
+      }
       await this.configHandler.reloadConfig();
     });
 
+    fs.watchFile(
+      getConfigYamlPath("vscode"),
+      { interval: 1000 },
+      async (stats) => {
+        if (stats.size === 0) {
+          return;
+        }
+        await this.configHandler.reloadConfig();
+      },
+    );
+
     fs.watchFile(getConfigTsPath(), { interval: 1000 }, (stats) => {
+      if (stats.size === 0) {
+        return;
+      }
       this.configHandler.reloadConfig();
     });
 
     vscode.workspace.onDidSaveTextDocument(async (event) => {
-      // Listen for file changes in the workspace
-      const filepath = event.uri.fsPath;
+      this.ide.updateLastFileSaveTimestamp();
+      this.core.invoke("files/changed", {
+        uris: [event.uri.toString()],
+      });
+    });
 
-      if (filepath === getConfigJsonPath()) {
-        // Trigger a toast notification to provide UI feedback that config
-        // has been updated
-        const showToast = context.globalState.get<boolean>(
-          "showConfigUpdateToast",
-          true,
-        );
+    vscode.workspace.onDidDeleteFiles(async (event) => {
+      this.core.invoke("files/deleted", {
+        uris: event.files.map((uri) => uri.toString()),
+      });
+    });
 
-        if (showToast) {
-          vscode.window
-            .showInformationMessage("Config updated", "Don't show again")
-            .then((selection) => {
-              if (selection === "Don't show again") {
-                context.globalState.update("showConfigUpdateToast", false);
-              }
-            });
-        }
-      }
-
-      if (
-        filepath.endsWith(".continuerc.json") ||
-        filepath.endsWith(".prompt")
-      ) {
-        this.configHandler.reloadConfig();
-      } else if (
-        filepath.endsWith(".continueignore") ||
-        filepath.endsWith(".gitignore")
-      ) {
-        // Reindex the workspaces
-        this.core.invoke("index/forceReIndex", undefined);
-      } else {
-        // Reindex the file
-        const indexer = await this.core.codebaseIndexerPromise;
-        indexer.refreshFile(filepath);
-      }
+    vscode.workspace.onDidCreateFiles(async (event) => {
+      this.core.invoke("files/created", {
+        uris: event.files.map((uri) => uri.toString()),
+      });
     });
 
     // When GitHub sign-in status changes, reload config
     vscode.authentication.onDidChangeSessions(async (e) => {
-      if (e.provider.id === "github") {
-        this.configHandler.reloadConfig();
-      } else if (e.provider.id === "continue") {
-        const sessionInfo = await getControlPlaneSessionInfo(true);
+      const env = await getControlPlaneEnv(this.ide.getIdeSettings());
+      if (e.provider.id === env.AUTH_TYPE) {
+        vscode.commands.executeCommand(
+          "setContext",
+          "continue.isSignedInToControlPlane",
+          true,
+        );
+
+        const sessionInfo = await getControlPlaneSessionInfo(true, false);
         this.webviewProtocolPromise.then(async (webviewProtocol) => {
-          webviewProtocol.request("didChangeControlPlaneSessionInfo", {
+          void webviewProtocol.request("didChangeControlPlaneSessionInfo", {
             sessionInfo,
           });
 
           // To make sure continue-proxy models and anything else requiring it get updated access token
           this.configHandler.reloadConfig();
         });
-        this.core.invoke("didChangeControlPlaneSessionInfo", { sessionInfo });
+        void this.core.invoke("didChangeControlPlaneSessionInfo", {
+          sessionInfo,
+        });
+      } else {
+        vscode.commands.executeCommand(
+          "setContext",
+          "continue.isSignedInToControlPlane",
+          false,
+        );
+
+        if (e.provider.id === "github") {
+          this.configHandler.reloadConfig();
+        }
       }
     });
 
     // Refresh index when branch is changed
     this.ide.getWorkspaceDirs().then((dirs) =>
       dirs.forEach(async (dir) => {
-        const repo = await this.ide.getRepo(vscode.Uri.file(dir));
+        const repo = await this.ide.getRepo(dir);
         if (repo) {
           repo.state.onDidChange(() => {
             // args passed to this callback are always undefined, so keep track of previous branch
@@ -295,7 +328,7 @@ export class VsCodeExtension {
                   currentBranch !== this.PREVIOUS_BRANCH_FOR_WORKSPACE_DIR[dir]
                 ) {
                   // Trigger refresh of index only in this directory
-                  this.core.invoke("index/forceReIndex", { dir });
+                  this.core.invoke("index/forceReIndex", { dirs: [dir] });
                 }
               }
 
@@ -326,11 +359,21 @@ export class VsCodeExtension {
     );
 
     this.ide.onDidChangeActiveTextEditor((filepath) => {
-      this.core.invoke("didChangeActiveTextEditor", { filepath });
+      void this.core.invoke("didChangeActiveTextEditor", { filepath });
+    });
+
+    vscode.workspace.onDidChangeConfiguration(async (event) => {
+      if (event.affectsConfiguration(EXTENSION_NAME)) {
+        const settings = await this.ide.getIdeSettings();
+        const webviewProtocol = await this.webviewProtocolPromise;
+        void webviewProtocol.request("didChangeIdeSettings", {
+          settings,
+        });
+      }
     });
   }
 
-  static continueVirtualDocumentScheme = "continue";
+  static continueVirtualDocumentScheme = EXTENSION_NAME;
 
   // eslint-disable-next-line @typescript-eslint/naming-convention
   private PREVIOUS_BRANCH_FOR_WORKSPACE_DIR: { [dir: string]: string } = {};

@@ -1,6 +1,6 @@
-import { getSymbolsForSnippet } from "core/autocomplete/ranking";
-import { RecentlyEditedRange } from "core/autocomplete/recentlyEdited";
-import { RangeInFileWithContents } from "core/commands/util";
+import { RangeInFileWithContents } from "core";
+import { getSymbolsForSnippet } from "core/autocomplete/context/ranking";
+import { RecentlyEditedRange } from "core/autocomplete/util/types";
 import * as vscode from "vscode";
 
 type VsCodeRecentlyEditedRange = {
@@ -23,9 +23,6 @@ export class RecentlyEditedTracker {
 
   constructor() {
     vscode.workspace.onDidChangeTextDocument((event) => {
-      if (event.document.uri.scheme !== "file") {
-        return;
-      }
       event.contentChanges.forEach((change) => {
         const editedRange = {
           uri: event.document.uri,
@@ -49,6 +46,11 @@ export class RecentlyEditedTracker {
   private async insertRange(
     editedRange: Omit<VsCodeRecentlyEditedRange, "lines" | "symbols">,
   ): Promise<void> {
+
+    if (editedRange.uri.scheme === "output") {
+      return;
+    }
+
     // Check for overlap with any existing ranges
     for (let i = 0; i < this.recentlyEditedRanges.length; i++) {
       let range = this.recentlyEditedRanges[i];
@@ -81,6 +83,7 @@ export class RecentlyEditedTracker {
         RecentlyEditedTracker.maxRecentlyEditedRanges,
       );
     }
+
   }
 
   private insertDocument(uri: vscode.Uri): void {
@@ -123,7 +126,7 @@ export class RecentlyEditedTracker {
     return this.recentlyEditedRanges.map((entry) => {
       return {
         ...entry,
-        filepath: entry.uri.fsPath,
+        filepath: entry.uri.toString(),
       };
     });
   }
@@ -140,7 +143,7 @@ export class RecentlyEditedTracker {
           const lines = contents.split("\n");
 
           return {
-            filepath: entry.uri.fsPath,
+            filepath: entry.uri.toString(),
             contents,
             range: {
               start: { line: 0, character: 0 },

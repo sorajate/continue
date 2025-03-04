@@ -4,13 +4,13 @@
 
 ## Checklist
 
-- [ ] The base branch of this PR is `dev`, rather than `main`
-- [ ] The relevant docs, if any, have been updated or created
+- [] The relevant docs, if any, have been updated or created
+- [] The relevant tests, if any, have been updated or created
 
 ## Screenshots
 
 [ For visual changes, include screenshots. ]
 
-## Testing
+## Testing instructions
 
-[ For new or modified features, provide step-by-step testing instructions to validate the intended behavior of the change. ]
+[ For new or modified features, provide step-by-step testing instructions to validate the intended behavior of the change, including any relevant tests to run. ]

@@ -1,42 +1,67 @@
+import path from "path";
+
+import { fetchwithRequestOptions } from "@continuedev/fetch";
+import ignore from "ignore";
+import * as URI from "uri-js";
 import { v4 as uuidv4 } from "uuid";
-import type { ContextItemId, IDE, IndexingProgressUpdate } from ".";
-import { CompletionProvider } from "./autocomplete/completionProvider";
+
+import { CompletionProvider } from "./autocomplete/CompletionProvider";
 import { ConfigHandler } from "./config/ConfigHandler";
+import { SYSTEM_PROMPT_DOT_FILE } from "./config/getSystemPromptDotFile";
 import {
   setupBestConfig,
   setupLocalConfig,
-  setupLocalConfigAfterFreeTrial,
   setupQuickstartConfig,
 } from "./config/onboarding";
-import { createNewPromptFile } from "./config/promptFile";
-import { addModel, addOpenAIKey, deleteModel } from "./config/util";
+import { addContextProvider, addModel, deleteModel } from "./config/util";
+import CodebaseContextProvider from "./context/providers/CodebaseContextProvider";
+import CurrentFileContextProvider from "./context/providers/CurrentFileContextProvider";
 import { recentlyEditedFilesCache } from "./context/retrieval/recentlyEditedFilesCache";
 import { ContinueServerClient } from "./continueServer/stubs/client";
 import { getAuthUrlForTokenPage } from "./control-plane/auth/index";
-import { ControlPlaneClient } from "./control-plane/client";
+import { getControlPlaneEnv } from "./control-plane/env";
+import { DevDataSqliteDb } from "./data/devdataSqlite";
+import { DataLogger } from "./data/log";
+import { streamDiffLines } from "./edit/streamDiffLines";
 import { CodebaseIndexer, PauseToken } from "./indexing/CodebaseIndexer";
 import DocsService from "./indexing/docs/DocsService";
+import { getAllSuggestedDocs } from "./indexing/docs/suggestions";
+import { defaultIgnoreFile } from "./indexing/ignore.js";
 import Ollama from "./llm/llms/Ollama";
-import type { FromCoreProtocol, ToCoreProtocol } from "./protocol";
+import { createNewPromptFileV2 } from "./promptFiles/v2/createNewPromptFile";
+import { callTool } from "./tools/callTool";
+import { ChatDescriber } from "./util/chatDescriber";
+import { clipboardCache } from "./util/clipboardCache";
 import { GlobalContext } from "./util/GlobalContext";
-import { logDevData } from "./util/devdata";
-import { DevDataSqliteDb } from "./util/devdataSqlite";
-import { fetchwithRequestOptions } from "./util/fetchWithOptions";
 import historyManager from "./util/history";
-import type { IMessenger, Message } from "./util/messenger";
-import { editConfigJson } from "./util/paths";
+import {
+  editConfigJson,
+  getConfigJsonPath,
+  migrateV1DevDataFiles,
+} from "./util/paths";
+import { localPathToUri } from "./util/pathToUri";
 import { Telemetry } from "./util/posthog";
+import { getSymbolsForManyFiles } from "./util/treeSitter";
 import { TTS } from "./util/tts";
-import { streamDiffLines } from "./util/verticalEdit";
+
+import {
+  ChatMessage,
+  DiffLine,
+  PromptLog,
+  type ContextItemId,
+  type IDE,
+  type IndexingProgressUpdate,
+} from ".";
+
+import type { FromCoreProtocol, ToCoreProtocol } from "./protocol";
+import type { IMessenger, Message } from "./protocol/messenger";
 
 export class Core {
-  // implements IMessenger<ToCoreProtocol, FromCoreProtocol>
   configHandler: ConfigHandler;
   codebaseIndexerPromise: Promise<CodebaseIndexer>;
   completionProvider: CompletionProvider;
   continueServerClientPromise: Promise<ContinueServerClient>;
-  indexingState: IndexingProgressUpdate;
-  controlPlaneClient: ControlPlaneClient;
+  codebaseIndexingState: IndexingProgressUpdate;
   private docsService: DocsService;
   private globalContext = new GlobalContext();
 
@@ -45,16 +70,6 @@ export class Core {
   );
 
   private abortedMessageIds: Set<string> = new Set();
-
-  private selectedModelTitle: string | undefined;
-
-  private async config() {
-    return this.configHandler.loadConfig();
-  }
-
-  private async getSelectedModel() {
-    return await this.configHandler.llmFromTitle(this.selectedModelTitle);
-  }
 
   invoke<T extends keyof ToCoreProtocol>(
     messageType: T,
@@ -68,7 +83,7 @@ export class Core {
     data: FromCoreProtocol[T][0],
     messageId?: string,
   ): string {
-    return this.messenger.send(messageType, data);
+    return this.messenger.send(messageType, data, messageId);
   }
 
   // TODO: It shouldn't actually need an IDE type, because this can happen
@@ -78,20 +93,27 @@ export class Core {
     private readonly ide: IDE,
     private readonly onWrite: (text: string) => Promise<void> = async () => {},
   ) {
-    this.indexingState = { status: "loading", desc: "loading", progress: 0 };
+    // Ensure .continue directory is created
+    migrateV1DevDataFiles();
 
+    this.codebaseIndexingState = {
+      status: "loading",
+      desc: "loading",
+      progress: 0,
+    };
+
+    const ideInfoPromise = messenger.request("getIdeInfo", undefined);
     const ideSettingsPromise = messenger.request("getIdeSettings", undefined);
     const sessionInfoPromise = messenger.request("getControlPlaneSessionInfo", {
       silent: true,
+      useOnboarding: false,
     });
-
-    this.controlPlaneClient = new ControlPlaneClient(sessionInfoPromise);
 
     this.configHandler = new ConfigHandler(
       this.ide,
       ideSettingsPromise,
       this.onWrite,
-      this.controlPlaneClient,
+      sessionInfoPromise,
     );
 
     this.docsService = DocsService.createSingleton(
@@ -100,13 +122,37 @@ export class Core {
       this.messenger,
     );
 
-    this.configHandler.onConfigUpdate(
-      (() => this.messenger.send("configUpdate", undefined)).bind(this),
+    this.configHandler.onConfigUpdate(async (result) => {
+      const serializedResult = await this.configHandler.getSerializedConfig();
+      this.messenger.send("configUpdate", {
+        result: serializedResult,
+        profileId:
+          this.configHandler.currentProfile?.profileDescription.id ?? null,
+      });
+
+      // update additional submenu context providers registered via VSCode API
+      const additionalProviders =
+        this.configHandler.getAdditionalSubmenuContextProviders();
+      if (additionalProviders.length > 0) {
+        this.messenger.send("refreshSubmenuItems", {
+          providers: additionalProviders,
+        });
+      }
+    });
+
+    this.configHandler.onDidChangeAvailableProfiles(
+      (profiles, selectedProfileId) =>
+        this.messenger.send("didChangeAvailableProfiles", {
+          profiles,
+          selectedProfileId,
+        }),
     );
 
-    this.configHandler.onDidChangeAvailableProfiles((profiles) =>
-      this.messenger.send("didChangeAvailableProfiles", { profiles }),
-    );
+    // Dev Data Logger
+    const dataLogger = DataLogger.getInstance();
+    dataLogger.core = this;
+    dataLogger.ideInfoPromise = ideInfoPromise;
+    dataLogger.ideSettingsPromise = ideSettingsPromise;
 
     // Codebase Indexer and ContinueServerClient depend on IdeSettings
     let codebaseIndexerResolve: (_: any) => void | undefined;
@@ -119,7 +165,7 @@ export class Core {
       (resolve) => (continueServerClientResolve = resolve),
     );
 
-    ideSettingsPromise.then((ideSettings) => {
+    void ideSettingsPromise.then((ideSettings) => {
       const continueServerClient = new ContinueServerClient(
         ideSettings.remoteConfigServerUrl,
         ideSettings.userToken,
@@ -136,29 +182,28 @@ export class Core {
       );
 
       // Index on initialization
-      this.ide.getWorkspaceDirs().then(async (dirs) => {
+      void this.ide.getWorkspaceDirs().then(async (dirs) => {
         // Respect pauseCodebaseIndexOnStart user settings
         if (ideSettings.pauseCodebaseIndexOnStart) {
-          await this.messenger.request("indexProgress", {
-            progress: 100,
+          this.indexingPauseToken.paused = true;
+          void this.messenger.request("indexProgress", {
+            progress: 0,
             desc: "Initial Indexing Skipped",
             status: "paused",
           });
           return;
         }
 
-        this.refreshCodebaseIndex(dirs);
+        void this.refreshCodebaseIndex(dirs);
       });
     });
 
     const getLlm = async () => {
-      const config = await this.configHandler.loadConfig();
-      const selected = this.globalContext.get("selectedTabAutocompleteModel");
-      return (
-        config.tabAutocompleteModels?.find(
-          (model) => model.title === selected,
-        ) ?? config.tabAutocompleteModels?.[0]
-      );
+      const { config } = await this.configHandler.loadConfig();
+      if (!config) {
+        return undefined;
+      }
+      return config.selectedModelByRole.autocomplete ?? undefined;
     };
     this.completionProvider = new CompletionProvider(
       this.configHandler,
@@ -170,23 +215,26 @@ export class Core {
 
     const on = this.messenger.on.bind(this.messenger);
 
-    this.messenger.onError((err) => {
-      console.error(err);
-      Telemetry.capture("core_messenger_error", {
+    // Note, VsCode's in-process messenger doesn't do anything with this
+    // It will only show for jetbrains
+    this.messenger.onError((message, err) => {
+      void Telemetry.capture("core_messenger_error", {
         message: err.message,
         stack: err.stack,
       });
-      this.ide.showToast("error", err.message);
-    });
 
-    // New
-    on("update/modelChange", (msg) => {
-      this.selectedModelTitle = msg.data;
-    });
-
-    on("update/selectTabAutocompleteModel", async (msg) => {
-      this.globalContext.update("selectedTabAutocompleteModel", msg.data);
-      this.configHandler.reloadConfig();
+      // Again, specifically for jetbrains to prevent duplicate error messages
+      // The same logic can currently be found in the webview protocol
+      // bc streaming errors are handled in the GUI
+      if (
+        ["llm/streamChat", "chatDescriber/describe"].includes(
+          message.messageType,
+        )
+      ) {
+        return;
+      } else {
+        void this.ide.showToast("error", err.message);
+      }
     });
 
     // Special
@@ -219,78 +267,101 @@ export class Core {
     });
 
     // Dev data
-    on("devdata/log", (msg) => {
-      logDevData(msg.data.tableName, msg.data.data);
+    on("devdata/log", async (msg) => {
+      void DataLogger.getInstance().logDevData(msg.data);
     });
 
     // Edit config
     on("config/addModel", (msg) => {
       const model = msg.data.model;
-      addModel(model);
-      this.configHandler.reloadConfig();
-    });
-
-    on("config/addOpenAiKey", (msg) => {
-      addOpenAIKey(msg.data);
-      this.configHandler.reloadConfig();
+      addModel(model, msg.data.role);
+      void this.configHandler.reloadConfig();
     });
 
     on("config/deleteModel", (msg) => {
       deleteModel(msg.data.title);
-      this.configHandler.reloadConfig();
+      void this.configHandler.reloadConfig();
     });
 
     on("config/newPromptFile", async (msg) => {
-      createNewPromptFile(
-        this.ide,
-        (await this.config()).experimental?.promptPath,
-      );
-      this.configHandler.reloadConfig();
+      const { config } = await this.configHandler.loadConfig();
+      await createNewPromptFileV2(this.ide, config?.experimental?.promptPath);
+      await this.configHandler.reloadConfig();
     });
 
-    on("config/reload", (msg) => {
-      this.configHandler.reloadConfig();
-      return this.configHandler.getSerializedConfig();
+    on("config/openProfile", async (msg) => {
+      await this.configHandler.openConfigProfile(msg.data.profileId);
+    });
+
+    on("config/reload", async (msg) => {
+      void this.configHandler.reloadConfig();
+      return await this.configHandler.getSerializedConfig();
     });
 
     on("config/ideSettingsUpdate", (msg) => {
       this.configHandler.updateIdeSettings(msg.data);
     });
+
     on("config/listProfiles", (msg) => {
       return this.configHandler.listProfiles();
     });
 
+    on("config/refreshProfiles", async (msg) => {
+      await this.configHandler.loadAssistantsForSelectedOrg();
+    });
+
+    on("config/addContextProvider", async (msg) => {
+      addContextProvider(msg.data, this.configHandler);
+    });
+
+    on("config/updateSharedConfig", async (msg) => {
+      const newSharedConfig = this.globalContext.updateSharedConfig(msg.data);
+      await this.configHandler.reloadConfig();
+      return newSharedConfig;
+    });
+
+    on("config/updateSelectedModel", async (msg) => {
+      const newSelectedModels = this.globalContext.updateSelectedModel(
+        msg.data.profileId,
+        msg.data.role,
+        msg.data.title,
+      );
+      await this.configHandler.reloadConfig();
+      return newSelectedModels;
+    });
+
+    on("controlPlane/openUrl", async (msg) => {
+      const env = await getControlPlaneEnv(this.ide.getIdeSettings());
+      let url = `${env.APP_URL}${msg.data.path}`;
+      if (msg.data.orgSlug) {
+        url += `?org=${msg.data.orgSlug}`;
+      }
+      await this.messenger.request("openUrl", url);
+    });
+
+    on("controlPlane/listOrganizations", async (msg) => {
+      return await this.configHandler.listOrganizations();
+    });
+
     // Context providers
     on("context/addDocs", async (msg) => {
-      let hasFailed = false;
-
-      for await (const result of this.docsService.indexAndAdd(msg.data)) {
-        if (result.status === "failed") {
-          hasFailed = true;
-          break;
-        }
-      }
-
-      if (hasFailed) {
-        this.ide.showToast("info", `Failed to index ${msg.data.startUrl}`);
-      } else {
-        this.ide.showToast("info", `Successfully indexed ${msg.data.startUrl}`);
-        this.messenger.send("refreshSubmenuItems", undefined);
-      }
+      void this.docsService.indexAndAdd(msg.data);
     });
 
     on("context/removeDocs", async (msg) => {
       await this.docsService.delete(msg.data.startUrl);
-      this.messenger.send("refreshSubmenuItems", undefined);
     });
 
     on("context/indexDocs", async (msg) => {
-      await this.docsService.indexAllDocs(msg.data.reIndex);
-      this.messenger.send("refreshSubmenuItems", undefined);
+      await this.docsService.syncDocsWithPrompt(msg.data.reIndex);
     });
 
     on("context/loadSubmenuItems", async (msg) => {
-      const config = await this.config();
+      const { config } = await this.configHandler.loadConfig();
+      if (!config) {
+        return [];
+      }
+
       const items = await config.contextProviders
         ?.find((provider) => provider.description.title === msg.data.title)
         ?.loadSubmenuItems({
@@ -303,12 +374,26 @@ export class Core {
     });
 
     on("context/getContextItems", async (msg) => {
-      const { name, query, fullInput, selectedCode } = msg.data;
-      const config = await this.config();
-      const llm = await this.getSelectedModel();
-      const provider = config.contextProviders?.find(
-        (provider) => provider.description.title === name,
-      );
+      const { config } = await this.configHandler.loadConfig();
+      if (!config) {
+        return [];
+      }
+
+      const { name, query, fullInput, selectedCode, selectedModelTitle } =
+        msg.data;
+
+      const llm = await this.configHandler.llmFromTitle(selectedModelTitle);
+      const provider =
+        config.contextProviders?.find(
+          (provider) => provider.description.title === name,
+        ) ??
+        [
+          // user doesn't need these in their config.json for the shortcuts to work
+          // option+enter
+          new CurrentFileContextProvider({}),
+          // cmd+enter
+          new CodebaseContextProvider({}),
+        ].find((provider) => provider.description.title === name);
       if (!provider) {
         return [];
       }
@@ -322,16 +407,16 @@ export class Core {
         const items = await provider.getContextItems(query, {
           config,
           llm,
-          embeddingsProvider: config.embeddingsProvider,
+          embeddingsProvider: config.selectedModelByRole.embed,
           fullInput,
           ide,
           selectedCode,
-          reranker: config.reranker,
+          reranker: config.selectedModelByRole.rerank,
           fetch: (url, init) =>
             fetchwithRequestOptions(url, init, config.requestOptions),
         });
 
-        Telemetry.capture(
+        void Telemetry.capture(
           "useContextProvider",
           {
             name: provider.description.title,
@@ -344,36 +429,81 @@ export class Core {
           id,
         }));
       } catch (e) {
-        this.ide.showToast(
-          "error",
-          `Error getting context items from ${name}: ${e}`,
-        );
+        let knownError = false;
+
+        if (e instanceof Error) {
+          // After removing transformers JS embeddings provider from jetbrains
+          // Should no longer see this error
+          // if (e.message.toLowerCase().includes("embeddings provider")) {
+          //   knownError = true;
+          //   const toastOption = "See Docs";
+          //   void this.ide
+          //     .showToast(
+          //       "error",
+          //       `Set up an embeddings model to use @${name}`,
+          //       toastOption,
+          //     )
+          //     .then((userSelection) => {
+          //       if (userSelection === toastOption) {
+          //         void this.ide.openUrl(
+          //           "https://docs.continue.dev/customize/model-roles/embeddings",
+          //         );
+          //       }
+          //     });
+          // }
+        }
+        if (!knownError) {
+          void this.ide.showToast(
+            "error",
+            `Error getting context items from ${name}: ${e}`,
+          );
+        }
         return [];
       }
     });
 
+    on("context/getSymbolsForFiles", async (msg) => {
+      const { uris } = msg.data;
+      return await getSymbolsForManyFiles(uris, this.ide);
+    });
+
     on("config/getSerializedProfileInfo", async (msg) => {
       return {
-        config: await this.configHandler.getSerializedConfig(),
-        profileId: this.configHandler.currentProfile.profileId,
+        result: await this.configHandler.getSerializedConfig(),
+        profileId:
+          this.configHandler.currentProfile?.profileDescription.id ?? null,
       };
+    });
+
+    on("clipboardCache/add", (msg) => {
+      const added = clipboardCache.add(uuidv4(), msg.data.content);
+      if (added) {
+        this.messenger.send("refreshSubmenuItems", {
+          providers: ["clipboard"],
+        });
+      }
     });
 
     async function* llmStreamChat(
       configHandler: ConfigHandler,
       abortedMessageIds: Set<string>,
       msg: Message<ToCoreProtocol["llm/streamChat"][0]>,
-    ) {
-      const config = await configHandler.loadConfig();
+    ): AsyncGenerator<ChatMessage, PromptLog> {
+      const { config } = await configHandler.loadConfig();
+      if (!config) {
+        throw new Error("Config not loaded");
+      }
 
       // Stop TTS on new StreamChat
       if (config.experimental?.readResponseTTS) {
-        TTS.kill();
+        void TTS.kill();
       }
 
       const model = await configHandler.llmFromTitle(msg.data.title);
+
       const gen = model.streamChat(
         msg.data.messages,
+        new AbortController().signal,
         msg.data.completionOptions,
       );
       let next = await gen.next();
@@ -391,15 +521,31 @@ export class Core {
           });
           break;
         }
-        yield { content: next.value.content };
+
+        const chunk = next.value;
+
+        yield chunk;
         next = await gen.next();
       }
 
       if (config.experimental?.readResponseTTS && "completion" in next.value) {
-        TTS.read(next.value?.completion);
+        void TTS.read(next.value?.completion);
       }
 
-      return { done: true, content: next.value };
+      void Telemetry.capture(
+        "chat",
+        {
+          model: model.model,
+          provider: model.providerName,
+        },
+        true,
+      );
+
+      if (!next.done) {
+        throw new Error("Will never happen");
+      }
+
+      return next.value;
     }
 
     on("llm/streamChat", (msg) =>
@@ -409,12 +555,12 @@ export class Core {
     async function* llmStreamComplete(
       configHandler: ConfigHandler,
       abortedMessageIds: Set<string>,
-
       msg: Message<ToCoreProtocol["llm/streamComplete"][0]>,
-    ) {
+    ): AsyncGenerator<string, PromptLog> {
       const model = await configHandler.llmFromTitle(msg.data.title);
       const gen = model.streamComplete(
         msg.data.prompt,
+        new AbortController().signal,
         msg.data.completionOptions,
       );
       let next = await gen.next();
@@ -432,11 +578,13 @@ export class Core {
           });
           break;
         }
-        yield { content: next.value };
+        yield next.value;
         next = await gen.next();
       }
-
-      return { done: true, content: next.value };
+      if (!next.done) {
+        throw new Error("This will never happen");
+      }
+      return next.value;
     }
 
     on("llm/streamComplete", (msg) =>
@@ -447,18 +595,23 @@ export class Core {
       const model = await this.configHandler.llmFromTitle(msg.data.title);
       const completion = await model.complete(
         msg.data.prompt,
+        new AbortController().signal,
         msg.data.completionOptions,
       );
       return completion;
     });
     on("llm/listModels", async (msg) => {
-      const config = await this.configHandler.loadConfig();
+      const { config } = await this.configHandler.loadConfig();
+      if (!config) {
+        return [];
+      }
+
       const model =
         config.models.find((model) => model.title === msg.data.title) ??
         config.models.find((model) => model.title?.startsWith(msg.data.title));
       try {
         if (model) {
-          return model.listModels();
+          return await model.listModels();
         } else {
           if (msg.data.title === "Ollama") {
             const models = await new Ollama({ model: "" }).listModels();
@@ -473,11 +626,19 @@ export class Core {
       }
     });
 
-    // Provide messenger to TTS so it can set GUI active / inactive state
+    // Provide messenger to utils so they can interact with GUI + state
     TTS.messenger = this.messenger;
+    ChatDescriber.messenger = this.messenger;
 
     on("tts/kill", async () => {
-      TTS.kill();
+      void TTS.kill();
+    });
+
+    on("chatDescriber/describe", async (msg) => {
+      const currentModel = await this.configHandler.llmFromTitle(
+        msg.data.selectedModelTitle,
+      );
+      return await ChatDescriber.describe(currentModel, {}, msg.data.text);
     });
 
     async function* runNodeJsSlashCommand(
@@ -485,7 +646,7 @@ export class Core {
       abortedMessageIds: Set<string>,
       msg: Message<ToCoreProtocol["command/run"][0]>,
       messenger: IMessenger<ToCoreProtocol, FromCoreProtocol>,
-    ) {
+    ): AsyncGenerator<string> {
       const {
         input,
         history,
@@ -495,9 +656,14 @@ export class Core {
         params,
         historyIndex,
         selectedCode,
+        completionOptions,
       } = msg.data;
 
-      const config = await configHandler.loadConfig();
+      const { config } = await configHandler.loadConfig();
+      if (!config) {
+        throw new Error("Config not loaded");
+      }
+
       const llm = await configHandler.llmFromTitle(modelTitle);
       const slashCommand = config.slashCommands?.find(
         (sc) => sc.name === slashCommandName,
@@ -506,7 +672,7 @@ export class Core {
         throw new Error(`Unknown slash command ${slashCommandName}`);
       }
 
-      Telemetry.capture(
+      void Telemetry.capture(
         "useSlashCommand",
         {
           name: slashCommandName,
@@ -521,34 +687,40 @@ export class Core {
         }
       }, 100);
 
-      for await (const content of slashCommand.run({
-        input,
-        history,
-        llm,
-        contextItems,
-        params,
-        ide,
-        addContextItem: (item) => {
-          messenger.request("addContextItem", {
-            item,
-            historyIndex,
-          });
-        },
-        selectedCode,
-        config,
-        fetch: (url, init) =>
-          fetchwithRequestOptions(url, init, config.requestOptions),
-      })) {
-        if (abortedMessageIds.has(msg.messageId)) {
-          abortedMessageIds.delete(msg.messageId);
-          break;
+      try {
+        for await (const content of slashCommand.run({
+          input,
+          history,
+          llm,
+          contextItems,
+          params,
+          ide,
+          addContextItem: (item) => {
+            void messenger.request("addContextItem", {
+              item,
+              historyIndex,
+            });
+          },
+          selectedCode,
+          config,
+          fetch: (url, init) =>
+            fetchwithRequestOptions(url, init, config.requestOptions),
+          completionOptions,
+        })) {
+          if (abortedMessageIds.has(msg.messageId)) {
+            abortedMessageIds.delete(msg.messageId);
+            clearInterval(checkActiveInterval);
+            break;
+          }
+          if (content) {
+            yield content;
+          }
         }
-        if (content) {
-          yield { content };
-        }
+      } catch (e) {
+        throw e;
+      } finally {
+        clearInterval(checkActiveInterval);
       }
-      clearInterval(checkActiveInterval);
-      yield { done: true, content: "" };
     }
     on("command/run", (msg) =>
       runNodeJsSlashCommand(
@@ -568,7 +740,9 @@ export class Core {
         );
       return outcome ? [outcome.completion] : [];
     });
-    on("autocomplete/accept", async (msg) => {});
+    on("autocomplete/accept", async (msg) => {
+      this.completionProvider.accept(msg.data.completionId);
+    });
     on("autocomplete/cancel", async (msg) => {
       this.completionProvider.cancel();
     });
@@ -577,7 +751,7 @@ export class Core {
       configHandler: ConfigHandler,
       abortedMessageIds: Set<string>,
       msg: Message<ToCoreProtocol["streamDiffLines"][0]>,
-    ) {
+    ): AsyncGenerator<DiffLine> {
       const data = msg.data;
       const llm = await configHandler.llmFromTitle(msg.data.modelTitle);
       for await (const diffLine of streamDiffLines(
@@ -587,16 +761,15 @@ export class Core {
         llm,
         data.input,
         data.language,
+        false,
+        undefined,
       )) {
         if (abortedMessageIds.has(msg.messageId)) {
           abortedMessageIds.delete(msg.messageId);
           break;
         }
-        console.log(diffLine);
-        yield { content: diffLine };
+        yield diffLine;
       }
-
-      return { done: true };
     }
 
     on("streamDiffLines", (msg) =>
@@ -621,10 +794,6 @@ export class Core {
           editConfigJsonCallback = setupQuickstartConfig;
           break;
 
-        case "LocalAfterFreeTrial":
-          editConfigJsonCallback = setupLocalConfigAfterFreeTrial;
-          break;
-
         case "Best":
           editConfigJsonCallback = setupBestConfig;
           break;
@@ -636,7 +805,7 @@ export class Core {
 
       editConfigJson(editConfigJsonCallback);
 
-      this.configHandler.reloadConfig();
+      void this.configHandler.reloadConfig();
     });
 
     on("addAutocompleteModel", (msg) => {
@@ -646,7 +815,7 @@ export class Core {
           tabAutocompleteModel: msg.data.model,
         };
       });
-      this.configHandler.reloadConfig();
+      void this.configHandler.reloadConfig();
     });
 
     on("stats/getTokensPerDay", async (msg) => {
@@ -657,54 +826,269 @@ export class Core {
       const rows = await DevDataSqliteDb.getTokensPerModel();
       return rows;
     });
+
+    // Codebase indexing
     on("index/forceReIndex", async ({ data }) => {
       if (data?.shouldClearIndexes) {
         const codebaseIndexer = await this.codebaseIndexerPromise;
         await codebaseIndexer.clearIndexes();
       }
 
-      const dirs = data?.dir ? [data.dir] : await this.ide.getWorkspaceDirs();
+      const dirs = data?.dirs ?? (await this.ide.getWorkspaceDirs());
       await this.refreshCodebaseIndex(dirs);
     });
     on("index/setPaused", (msg) => {
-      new GlobalContext().update("indexingPaused", msg.data);
+      this.globalContext.update("indexingPaused", msg.data);
       this.indexingPauseToken.paused = msg.data;
     });
     on("index/indexingProgressBarInitialized", async (msg) => {
       // Triggered when progress bar is initialized.
       // If a non-default state has been stored, update the indexing display to that state
-      if (this.indexingState.status !== "loading") {
-        this.messenger.request("indexProgress", this.indexingState);
+      if (this.codebaseIndexingState.status !== "loading") {
+        void this.messenger.request(
+          "indexProgress",
+          this.codebaseIndexingState,
+        );
       }
     });
 
-    on("didChangeSelectedProfile", (msg) => {
-      this.configHandler.setSelectedProfile(msg.data.id);
-      this.configHandler.reloadConfig();
+    // File changes
+    // TODO - remove remaining logic for these from IDEs where possible
+    on("files/changed", async ({ data }) => {
+      if (data?.uris?.length) {
+        for (const uri of data.uris) {
+          // Listen for file changes in the workspace
+          // URI TODO is this equality statement valid?
+          if (URI.equal(uri, localPathToUri(getConfigJsonPath()))) {
+            // Trigger a toast notification to provide UI feedback that config has been updated
+            const showToast =
+              this.globalContext.get("showConfigUpdateToast") ?? true;
+            if (showToast) {
+              const selection = await this.ide.showToast(
+                "info",
+                "Config updated",
+                "Don't show again",
+              );
+              if (selection === "Don't show again") {
+                this.globalContext.update("showConfigUpdateToast", false);
+              }
+            }
+          }
+
+          if (
+            uri.endsWith(".continuerc.json") ||
+            uri.endsWith(".prompt") ||
+            uri.endsWith(SYSTEM_PROMPT_DOT_FILE)
+          ) {
+            await this.configHandler.reloadConfig();
+          } else if (
+            uri.endsWith(".continueignore") ||
+            uri.endsWith(".gitignore")
+          ) {
+            // Reindex the workspaces
+            this.invoke("index/forceReIndex", undefined);
+          } else {
+            // Reindex the file
+            await this.refreshCodebaseIndexFiles([uri]);
+          }
+        }
+      }
     });
+
+    on("files/created", async ({ data }) => {
+      if (data?.uris?.length) {
+        this.messenger.send("refreshSubmenuItems", {
+          providers: ["file"],
+        });
+        await this.refreshCodebaseIndexFiles(data.uris);
+      }
+    });
+
+    on("files/deleted", async ({ data }) => {
+      if (data?.uris?.length) {
+        this.messenger.send("refreshSubmenuItems", {
+          providers: ["file"],
+        });
+        await this.refreshCodebaseIndexFiles(data.uris);
+      }
+    });
+    on("files/opened", async ({ data }) => {
+      if (data?.uris?.length) {
+        // Do something on files opened
+      }
+    });
+
+    // Docs, etc. indexing
+    on("indexing/reindex", async (msg) => {
+      if (msg.data.type === "docs") {
+        void this.docsService.reindexDoc(msg.data.id);
+      }
+    });
+    on("indexing/abort", async (msg) => {
+      if (msg.data.type === "docs") {
+        this.docsService.abort(msg.data.id);
+      }
+    });
+    on("indexing/setPaused", async (msg) => {
+      if (msg.data.type === "docs") {
+        // this.docsService.setPaused(msg.data.id, msg.data.paused); // not supported yet
+      }
+    });
+    on("docs/getSuggestedDocs", async (msg) => {
+      if (hasRequestedDocs) {
+        return;
+      } // TODO, remove, hack because of rerendering
+      hasRequestedDocs = true;
+      const suggestedDocs = await getAllSuggestedDocs(this.ide);
+      this.messenger.send("docs/suggestions", suggestedDocs);
+    });
+    on("docs/initStatuses", async (msg) => {
+      void this.docsService.initStatuses();
+    });
+    on("docs/getDetails", async (msg) => {
+      return await this.docsService.getDetails(msg.data.startUrl);
+    });
+    //
+
+    on("didChangeSelectedProfile", (msg) => {
+      void this.configHandler.setSelectedProfile(msg.data.id);
+      void this.configHandler.reloadConfig();
+    });
+
+    on("didChangeSelectedOrg", (msg) => {
+      void this.configHandler.setSelectedOrgId(msg.data.id);
+      void this.configHandler.reloadConfig();
+      void this.configHandler.loadAssistantsForSelectedOrg();
+    });
+
     on("didChangeControlPlaneSessionInfo", async (msg) => {
-      this.configHandler.updateControlPlaneSessionInfo(msg.data.sessionInfo);
+      await this.configHandler.updateControlPlaneSessionInfo(
+        msg.data.sessionInfo,
+      );
     });
     on("auth/getAuthUrl", async (msg) => {
-      const url = await getAuthUrlForTokenPage();
+      const url = await getAuthUrlForTokenPage(
+        ideSettingsPromise,
+        msg.data.useOnboarding,
+      );
       return { url };
     });
 
-    on("didChangeActiveTextEditor", ({ data: { filepath } }) => {
-      recentlyEditedFilesCache.set(filepath, filepath);
+    on("didChangeActiveTextEditor", async ({ data: { filepath } }) => {
+      const ignoreInstance = ignore().add(defaultIgnoreFile);
+      let rootDirectory = await this.ide.getWorkspaceDirs();
+      const relativeFilePath = path.relative(rootDirectory[0], filepath);
+      try {
+        if (!ignoreInstance.ignores(relativeFilePath)) {
+          recentlyEditedFilesCache.set(filepath, filepath);
+        }
+      } catch (e) {
+        if (e instanceof RangeError) {
+          // do nothing, this can happen when editing a file outside the workspace such as `../extensions/.continue-debug/config.json`
+        } else {
+          console.debug("unhandled ignores error", relativeFilePath, e);
+        }
+      }
+    });
+
+    on("tools/call", async ({ data: { toolCall, selectedModelTitle } }) => {
+      const { config } = await this.configHandler.loadConfig();
+      if (!config) {
+        throw new Error("Config not loaded");
+      }
+
+      const tool = config.tools.find(
+        (t) => t.function.name === toolCall.function.name,
+      );
+
+      if (!tool) {
+        throw new Error(`Tool ${toolCall.function.name} not found`);
+      }
+
+      const llm = await this.configHandler.llmFromTitle(selectedModelTitle);
+
+      const contextItems = await callTool(
+        tool,
+        JSON.parse(toolCall.function.arguments || "{}"),
+        {
+          ide: this.ide,
+          llm,
+          fetch: (url, init) =>
+            fetchwithRequestOptions(url, init, config.requestOptions),
+          tool,
+        },
+      );
+
+      if (tool.faviconUrl) {
+        contextItems.forEach((item) => {
+          item.icon = tool.faviconUrl;
+        });
+      }
+
+      return { contextItems };
     });
   }
 
   private indexingCancellationController: AbortController | undefined;
+  private async sendIndexingErrorTelemetry(update: IndexingProgressUpdate) {
+    console.debug(
+      "Indexing failed with error: ",
+      update.desc,
+      update.debugInfo,
+    );
+    void Telemetry.capture(
+      "indexing_error",
+      {
+        error: update.desc,
+        stack: update.debugInfo,
+      },
+      false,
+    );
+  }
 
-  private async refreshCodebaseIndex(dirs: string[]) {
+  private async refreshCodebaseIndex(paths: string[]) {
     if (this.indexingCancellationController) {
       this.indexingCancellationController.abort();
     }
     this.indexingCancellationController = new AbortController();
-    for await (const update of (await this.codebaseIndexerPromise).refresh(
-      dirs,
+    for await (const update of (await this.codebaseIndexerPromise).refreshDirs(
+      paths,
       this.indexingCancellationController.signal,
+    )) {
+      let updateToSend = { ...update };
+      // TODO reconsider this status overwrite?
+      // original goal was to not concern users with edge noncritical errors
+      if (update.status === "failed") {
+        updateToSend.status = "done";
+        updateToSend.desc = "Indexing complete";
+        updateToSend.progress = 1.0;
+      }
+
+      void this.messenger.request("indexProgress", updateToSend);
+      this.codebaseIndexingState = updateToSend;
+
+      if (update.status === "failed") {
+        void this.sendIndexingErrorTelemetry(update);
+      }
+    }
+
+    this.messenger.send("refreshSubmenuItems", {
+      providers: "dependsOnIndexing",
+    });
+    this.indexingCancellationController = undefined;
+  }
+
+  private async refreshCodebaseIndexFiles(files: string[]) {
+    // Can be cancelled by codebase index but not vice versa
+    if (
+      this.indexingCancellationController &&
+      !this.indexingCancellationController.signal.aborted
+    ) {
+      return;
+    }
+    this.indexingCancellationController = new AbortController();
+    for await (const update of (await this.codebaseIndexerPromise).refreshFiles(
+      files,
     )) {
       let updateToSend = { ...update };
       if (update.status === "failed") {
@@ -713,26 +1097,21 @@ export class Core {
         updateToSend.progress = 1.0;
       }
 
-      this.messenger.request("indexProgress", updateToSend);
-      this.indexingState = updateToSend;
+      void this.messenger.request("indexProgress", updateToSend);
+      this.codebaseIndexingState = updateToSend;
 
       if (update.status === "failed") {
-        console.debug(
-          "Indexing failed with error: ",
-          update.desc,
-          update.debugInfo,
-        );
-        Telemetry.capture(
-          "indexing_error",
-          {
-            error: update.desc,
-            stack: update.debugInfo,
-          },
-          false,
-        );
+        void this.sendIndexingErrorTelemetry(update);
       }
     }
 
-    this.messenger.send("refreshSubmenuItems", undefined);
+    this.messenger.send("refreshSubmenuItems", {
+      providers: "dependsOnIndexing",
+    });
+    this.indexingCancellationController = undefined;
   }
+
+  // private
 }
+
+let hasRequestedDocs = false;

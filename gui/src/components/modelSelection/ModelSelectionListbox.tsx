@@ -1,18 +1,22 @@
 import { Transition } from "@headlessui/react";
-import { CheckIcon, ChevronUpDownIcon } from "@heroicons/react/24/outline";
-import { Dispatch, Fragment, SetStateAction } from "react";
+import {
+  CheckIcon,
+  ChevronUpDownIcon,
+  CubeIcon,
+} from "@heroicons/react/24/outline";
+import { Fragment } from "react";
 import { Listbox } from "@headlessui/react";
 import styled from "styled-components";
 import {
   defaultBorderRadius,
   lightGray,
   vscBackground,
-  vscButtonBackground,
   vscForeground,
   vscInputBackground,
   vscListActiveBackground,
   vscListActiveForeground,
 } from "..";
+import { DisplayInfo } from "../../pages/AddNewModel/configs/models";
 
 export const StyledListbox = styled(Listbox)`
   background-color: ${vscBackground};
@@ -81,7 +85,7 @@ export const StyledListboxOption = styled(Listbox.Option)<{
   background-color: ${({ selected }) =>
     selected ? vscListActiveBackground : vscInputBackground};
   cursor: pointer;
-  padding: 6px 8px;
+  padding: 6px 8px 6px 12px;
 
   display: flex;
   gap: 8px;
@@ -93,35 +97,31 @@ export const StyledListboxOption = styled(Listbox.Option)<{
   }
 `;
 
-interface DisplayInfo {
-  title: string;
-  icon?: string;
-}
-
 interface ModelSelectionListboxProps {
   selectedProvider: DisplayInfo;
-  setSelectedProvider: Dispatch<SetStateAction<DisplayInfo>>;
-  options: DisplayInfo[];
+  setSelectedProvider: (val: DisplayInfo) => void;
+  topOptions?: DisplayInfo[];
+  otherOptions?: DisplayInfo[];
 }
 
 function ModelSelectionListbox({
   selectedProvider,
   setSelectedProvider,
-  options,
+  topOptions = [],
+  otherOptions = [],
 }: ModelSelectionListboxProps) {
   return (
     <StyledListbox value={selectedProvider} onChange={setSelectedProvider}>
-      <div className="relative mt-1">
+      <div className="relative mb-2 mt-1">
         <StyledListboxButton>
           <span className="flex items-center">
             {window.vscMediaUrl && selectedProvider.icon && (
               <img
                 src={`${window.vscMediaUrl}/logos/${selectedProvider.icon}`}
-                height="24px"
-                style={{ marginRight: "10px" }}
+                className="mr-3 h-4 w-4 object-contain object-center"
               />
             )}
-            <span className="text-md">{selectedProvider.title}</span>
+            <span className="text-xs">{selectedProvider.title}</span>
           </span>
           <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-2">
             <ChevronUpDownIcon
@@ -137,37 +137,81 @@ function ModelSelectionListbox({
           leaveTo="opacity-0"
         >
           <StyledListboxOptions>
-            {options.map((option, index) => (
-              <StyledListboxOption
-                selected={selectedProvider.title === option.title}
-                key={index}
-                className={({ active }: { active: boolean }) =>
-                  `relative cursor-default select-none py-2 pl-10 pr-4 ${
-                    active ? "bg-amber-100 text-amber-900" : "text-gray-900"
-                  }`
-                }
-                value={option}
-              >
-                {({ selected }) => (
-                  <>
-                    {window.vscMediaUrl && option.icon && (
-                      <img
-                        src={`${window.vscMediaUrl}/logos/${option.icon}`}
-                        height="24px"
-                        style={{ marginRight: "10px" }}
-                      />
-                    )}
-                    <span className="text-md">{option.title}</span>
+            {topOptions.length > 0 && (
+              <div className="py-1">
+                {topOptions.map((option, index) => (
+                  <StyledListboxOption
+                    selected={selectedProvider.title === option.title}
+                    key={index}
+                    className="relative cursor-default select-none py-2 pr-4 text-gray-400"
+                    value={option}
+                  >
+                    {({ selected }) => (
+                      <>
+                        {option.title === "Autodetect" ? (
+                          <CubeIcon className="mr-2 h-4 w-4 text-gray-400" />
+                        ) : (
+                          window.vscMediaUrl &&
+                          option.icon && (
+                            <img
+                              src={`${window.vscMediaUrl}/logos/${option.icon}`}
+                              className="mr-1 h-4 w-4 object-contain object-center"
+                            />
+                          )
+                        )}
+                        <span className="text-xs">{option.title}</span>
 
-                    {selected ? (
-                      <span className="inset-y-0 ml-auto flex items-center pl-3 text-amber-600">
-                        <CheckIcon className="h-5 w-5" aria-hidden="true" />
-                      </span>
-                    ) : null}
-                  </>
-                )}
-              </StyledListboxOption>
-            ))}
+                        {selected && (
+                          <span className="inset-y-0 ml-auto flex items-center pl-3">
+                            <CheckIcon className="h-5 w-5" aria-hidden="true" />
+                          </span>
+                        )}
+                      </>
+                    )}
+                  </StyledListboxOption>
+                ))}
+              </div>
+            )}
+
+            {topOptions.length > 0 && otherOptions.length > 0 && (
+              <div className="my-1 h-px bg-zinc-500" />
+            )}
+
+            {otherOptions.length > 0 && (
+              <div className="py-1">
+                {otherOptions.map((option, index) => (
+                  <StyledListboxOption
+                    selected={selectedProvider.title === option.title}
+                    key={index}
+                    className="relative cursor-default select-none py-2 pr-4 text-gray-400"
+                    value={option}
+                  >
+                    {({ selected }) => (
+                      <>
+                        {option.title === "Autodetect" ? (
+                          <CubeIcon className="mr-2 h-4 w-4 text-gray-400" />
+                        ) : (
+                          window.vscMediaUrl &&
+                          option.icon && (
+                            <img
+                              src={`${window.vscMediaUrl}/logos/${option.icon}`}
+                              className="mr-1 h-4 w-4 object-contain object-center"
+                            />
+                          )
+                        )}
+                        <span className="text-xs">{option.title}</span>
+
+                        {selected && (
+                          <span className="inset-y-0 ml-auto flex items-center pl-3">
+                            <CheckIcon className="h-5 w-5" aria-hidden="true" />
+                          </span>
+                        )}
+                      </>
+                    )}
+                  </StyledListboxOption>
+                ))}
+              </div>
+            )}
           </StyledListboxOptions>
         </Transition>
       </div>

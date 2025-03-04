@@ -8,7 +8,7 @@ import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.editor.actionSystem.EditorAction
 import com.intellij.openapi.editor.actionSystem.EditorActionHandler
 
-class AcceptAutocompleteAction: EditorAction(object : EditorActionHandler() {
+class AcceptAutocompleteAction : EditorAction(object : EditorActionHandler() {
     override fun doExecute(editor: Editor, caret: Caret?, dataContext: DataContext?) {
         ApplicationManager.getApplication().runWriteAction {
             editor.project?.service<AutocompleteService>()?.accept()
@@ -22,4 +22,4 @@ class AcceptAutocompleteAction: EditorAction(object : EditorActionHandler() {
                 && autocompleteService.pendingCompletion?.text != null
         return enabled
     }
-}) {}
+})

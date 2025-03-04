@@ -1,84 +1,36 @@
-import { EllipsisHorizontalCircleIcon } from "@heroicons/react/24/outline";
-import { useContext, useEffect } from "react";
-import { useDispatch, useSelector } from "react-redux";
+import { useEffect, useMemo } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 import styled from "styled-components";
-import {
-  CustomScrollbarDiv,
-  defaultBorderRadius,
-  vscForeground,
-  vscInputBackground,
-} from ".";
-import { IdeMessengerContext } from "../context/IdeMessenger";
+import { CustomScrollbarDiv, defaultBorderRadius } from ".";
+import { AuthProvider } from "../context/Auth";
 import { useWebviewListener } from "../hooks/useWebviewListener";
-import { defaultModelSelector } from "../redux/selectors/modelSelectors";
+import { useAppDispatch, useAppSelector } from "../redux/hooks";
+import { selectUseHub } from "../redux/selectors";
+import { focusEdit, setEditStatus } from "../redux/slices/editModeState";
 import {
-  setBottomMessage,
-  setBottomMessageCloseTimeout,
-  setOnboardingCard,
-  setShowDialog,
-} from "../redux/slices/uiStateSlice";
-import { RootState } from "../redux/store";
+  addCodeToEdit,
+  newSession,
+  selectIsInEditMode,
+  setMode,
+  updateApplyState,
+} from "../redux/slices/sessionSlice";
+import { setShowDialog } from "../redux/slices/uiSlice";
+import { exitEditMode } from "../redux/thunks";
+import { loadLastSession, saveCurrentSession } from "../redux/thunks/session";
 import { getFontSize, isMetaEquivalentKeyPressed } from "../util";
-import { FREE_TRIAL_LIMIT_REQUESTS } from "../util/freeTrial";
-import { getLocalStorage, setLocalStorage } from "../util/localStorage";
+import { incrementFreeTrialCount } from "../util/freeTrial";
+import { ROUTES } from "../util/navigation";
 import TextDialog from "./dialogs";
-import HeaderButtonWithText from "./HeaderButtonWithText";
-import ProgressBar from "./loaders/ProgressBar";
+import Footer from "./Footer";
+import { isNewUserOnboarding, useOnboardingCard } from "./OnboardingCard";
+import OSRContextMenu from "./OSRContextMenu";
 import PostHogPageView from "./PosthogPageView";
-import ProfileSwitcher from "./ProfileSwitcher";
-import { isNewUserOnboarding } from "./OnboardingCard/utils";
-import { useOnboardingCard } from "./OnboardingCard";
-
-const FOOTER_HEIGHT = "1.8em";
 
 const LayoutTopDiv = styled(CustomScrollbarDiv)`
   height: 100%;
   border-radius: ${defaultBorderRadius};
   position: relative;
-
-  &::after {
-    position: absolute;
-    content: "";
-    width: 100%;
-    height: 1px;
-    background-color: rgba(136, 136, 136, 0.3);
-    top: 0;
-    left: 0;
-  }
-`;
-
-const BottomMessageDiv = styled.div<{ displayOnBottom: boolean }>`
-  position: fixed;
-  bottom: ${(props) => (props.displayOnBottom ? "50px" : undefined)};
-  top: ${(props) => (props.displayOnBottom ? undefined : "50px")};
-  left: 0;
-  right: 0;
-  margin: 8px;
-  margin-top: 0;
-  background-color: ${vscInputBackground};
-  color: ${vscForeground};
-  border-radius: ${defaultBorderRadius};
-  padding: 12px;
-  z-index: 100;
-  box-shadow: 0px 0px 2px 0px ${vscForeground};
-  max-height: 35vh;
-`;
-
-const Footer = styled.footer`
-  display: flex;
-  flex-direction: row;
-  gap: 8px;
-  justify-content: right;
-  padding: 8px;
-  align-items: center;
-  width: calc(100% - 16px);
-  height: ${FOOTER_HEIGHT};
-  background-color: transparent;
-  backdrop-filter: blur(12px);
-  border-top: 1px solid rgba(136, 136, 136, 0.3);
-  border-bottom: 1px solid rgba(136, 136, 136, 0.3);
-  overflow: hidden;
+  overflow-x: hidden;
 `;
 
 const GridDiv = styled.div`
@@ -88,66 +40,62 @@ const GridDiv = styled.div`
   overflow-x: visible;
 `;
 
-const ModelDropdownPortalDiv = styled.div`
-  background-color: ${vscInputBackground};
-  position: relative;
-  margin-left: 8px;
-  z-index: 200;
-  font-size: ${getFontSize()};
-`;
-
-const ProfileDropdownPortalDiv = styled.div`
-  background-color: ${vscInputBackground};
-  position: relative;
-  margin-left: calc(100% - 190px);
-  z-index: 200;
-  font-size: ${getFontSize() - 2};
-`;
-
 const Layout = () => {
   const navigate = useNavigate();
   const location = useLocation();
-  const dispatch = useDispatch();
-  const ideMessenger = useContext(IdeMessengerContext);
+  const dispatch = useAppDispatch();
   const onboardingCard = useOnboardingCard();
+  const { pathname } = useLocation();
 
-  const dialogMessage = useSelector(
-    (state: RootState) => state.uiState.dialogMessage,
+  const configError = useAppSelector((state) => state.config.configError);
+
+  const hasFatalErrors = useMemo(() => {
+    return configError?.some((error) => error.fatal);
+  }, [configError]);
+
+  const dialogMessage = useAppSelector((state) => state.ui.dialogMessage);
+
+  const showDialog = useAppSelector((state) => state.ui.showDialog);
+
+  useWebviewListener(
+    "newSession",
+    async () => {
+      navigate(ROUTES.HOME);
+      await dispatch(
+        saveCurrentSession({
+          openNewSession: true,
+          generateTitle: true,
+        }),
+      );
+      dispatch(exitEditMode());
+    },
+    [],
   );
-  const showDialog = useSelector(
-    (state: RootState) => state.uiState.showDialog,
+
+  useWebviewListener(
+    "isContinueInputFocused",
+    async () => {
+      return false;
+    },
+    [location.pathname],
+    location.pathname === ROUTES.HOME,
   );
 
-  const defaultModel = useSelector(defaultModelSelector);
-
-  const bottomMessage = useSelector(
-    (state: RootState) => state.uiState.bottomMessage,
+  useWebviewListener(
+    "focusContinueInputWithNewSession",
+    async () => {
+      navigate(ROUTES.HOME);
+      await dispatch(
+        saveCurrentSession({
+          openNewSession: true,
+          generateTitle: true,
+        }),
+      );
+      dispatch(exitEditMode());
+    },
+    [location.pathname],
+    location.pathname === ROUTES.HOME,
   );
-  const displayBottomMessageOnBottom = useSelector(
-    (state: RootState) => state.uiState.displayBottomMessageOnBottom,
-  );
-
-  const timeline = useSelector((state: RootState) => state.state.history);
-
-  useEffect(() => {
-    const handleKeyDown = (event: any) => {
-      if (isMetaEquivalentKeyPressed(event) && event.code === "KeyC") {
-        const selection = window.getSelection()?.toString();
-        if (selection) {
-          // Copy to clipboard
-          setTimeout(() => {
-            navigator.clipboard.writeText(selection);
-          }, 100);
-        }
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [timeline]);
 
   useWebviewListener(
     "addModel",
@@ -157,18 +105,13 @@ const Layout = () => {
     [navigate],
   );
 
-  useWebviewListener("openSettings", async () => {
-    ideMessenger.post("openConfigJson", undefined);
-  });
-
   useWebviewListener(
-    "viewHistory",
-    async () => {
-      // Toggle the history page / main page
-      if (location.pathname === "/history") {
+    "navigateTo",
+    async (data) => {
+      if (data.toggle && location.pathname === data.path) {
         navigate("/");
       } else {
-        navigate("/history");
+        navigate(data.path);
       }
     },
     [location, navigate],
@@ -177,12 +120,21 @@ const Layout = () => {
   useWebviewListener(
     "incrementFtc",
     async () => {
-      const u = getLocalStorage("ftc");
-      if (u) {
-        setLocalStorage("ftc", u + 1);
-      } else {
-        setLocalStorage("ftc", 1);
-      }
+      incrementFreeTrialCount();
+    },
+    [],
+  );
+
+  useWebviewListener(
+    "updateApplyState",
+    async (state) => {
+      // dispatch(
+      //   updateCurCheckpoint({
+      //     filepath: state.filepath,
+      //     content: state.fileContent,
+      //   }),
+      // );
+      dispatch(updateApplyState(state));
     },
     [],
   );
@@ -203,6 +155,87 @@ const Layout = () => {
     [],
   );
 
+  useWebviewListener(
+    "focusEdit",
+    async () => {
+      await dispatch(
+        saveCurrentSession({
+          openNewSession: false,
+          // Because this causes a lag before Edit mode is focused. TODO just have that happen in background
+          generateTitle: false,
+        }),
+      );
+      dispatch(newSession());
+      dispatch(focusEdit());
+      dispatch(setMode("edit"));
+    },
+    [],
+  );
+
+  useWebviewListener(
+    "focusEditWithoutClear",
+    async () => {
+      await dispatch(
+        saveCurrentSession({
+          openNewSession: true,
+          generateTitle: true,
+        }),
+      );
+      dispatch(focusEdit());
+      dispatch(setMode("edit"));
+    },
+    [],
+  );
+
+  useWebviewListener(
+    "addCodeToEdit",
+    async (payload) => {
+      dispatch(addCodeToEdit(payload));
+    },
+    [navigate],
+  );
+
+  useWebviewListener(
+    "setEditStatus",
+    async ({ status, fileAfterEdit }) => {
+      dispatch(setEditStatus({ status, fileAfterEdit }));
+    },
+    [],
+  );
+
+  const isInEditMode = useAppSelector(selectIsInEditMode);
+  useWebviewListener("exitEditMode", async () => {
+    if (!isInEditMode) {
+      return;
+    }
+    dispatch(
+      loadLastSession({
+        saveCurrentSession: false,
+      }),
+    );
+    dispatch(exitEditMode());
+  });
+
+  useEffect(() => {
+    const handleKeyDown = (event: any) => {
+      if (isMetaEquivalentKeyPressed(event) && event.code === "KeyC") {
+        const selection = window.getSelection()?.toString();
+        if (selection) {
+          // Copy to clipboard
+          setTimeout(() => {
+            navigator.clipboard.writeText(selection);
+          }, 100);
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
   useEffect(() => {
     if (
       isNewUserOnboarding() &&
@@ -212,79 +245,68 @@ const Layout = () => {
     }
   }, [location]);
 
+  const useHub = useAppSelector(selectUseHub);
+
+  // Existing users that have already seen the onboarding card
+  // should be shown an intro card for hub.continue.dev
+  // useEffect(() => {
+  //   if (useHub !== true) {
+  //     return;
+  //   }
+  //   const seenHubIntro = getLocalStorage("seenHubIntro");
+  //   if (!onboardingCard.show && !seenHubIntro) {
+  //     onboardingCard.setActiveTab("ExistingUserHubIntro");
+  //   }
+  //   setLocalStorage("seenHubIntro", true);
+  // }, [onboardingCard.show, useHub]);
+
   return (
-    <LayoutTopDiv>
-      <div
-        style={{
-          scrollbarGutter: "stable both-edges",
-          minHeight: "100%",
-          display: "grid",
-          gridTemplateRows: "1fr auto",
-        }}
-      >
-        <TextDialog
-          showDialog={showDialog}
-          onEnter={() => {
-            dispatch(setShowDialog(false));
+    <AuthProvider>
+      <LayoutTopDiv>
+        <OSRContextMenu />
+        <div
+          style={{
+            scrollbarGutter: "stable both-edges",
+            minHeight: "100%",
+            display: "grid",
+            gridTemplateRows: "1fr auto",
           }}
-          onClose={() => {
-            dispatch(setShowDialog(false));
-          }}
-          message={dialogMessage}
-        />
-
-        <GridDiv>
-          <PostHogPageView />
-          <Outlet />
-          <ModelDropdownPortalDiv id="model-select-top-div"></ModelDropdownPortalDiv>
-          <ProfileDropdownPortalDiv id="profile-select-top-div"></ProfileDropdownPortalDiv>
-          <Footer>
-            <div className="mr-auto flex flex-grow gap-2 items-center overflow-hidden">
-              {defaultModel?.provider === "free-trial" && (
-                <ProgressBar
-                  completed={parseInt(localStorage.getItem("ftc") || "0")}
-                  total={FREE_TRIAL_LIMIT_REQUESTS}
-                />
-              )}
-            </div>
-
-            <ProfileSwitcher />
-            <HeaderButtonWithText
-              tooltipPlacement="top-end"
-              text="More"
-              onClick={() => {
-                if (location.pathname === "/help") {
-                  navigate("/");
-                } else {
-                  navigate("/help");
-                }
-              }}
-            >
-              <EllipsisHorizontalCircleIcon width="1.4em" height="1.4em" />
-            </HeaderButtonWithText>
-          </Footer>
-        </GridDiv>
-
-        <BottomMessageDiv
-          displayOnBottom={displayBottomMessageOnBottom}
-          onMouseEnter={() => {
-            dispatch(setBottomMessageCloseTimeout(undefined));
-          }}
-          onMouseLeave={(e) => {
-            if (!e.buttons) {
-              dispatch(setBottomMessage(undefined));
-            }
-          }}
-          hidden={!bottomMessage}
         >
-          {bottomMessage}
-        </BottomMessageDiv>
-      </div>
-      <div
-        style={{ fontSize: `${getFontSize() - 4}px` }}
-        id="tooltip-portal-div"
-      />
-    </LayoutTopDiv>
+          <TextDialog
+            showDialog={showDialog}
+            onEnter={() => {
+              dispatch(setShowDialog(false));
+            }}
+            onClose={() => {
+              dispatch(setShowDialog(false));
+            }}
+            message={dialogMessage}
+          />
+
+          <GridDiv className="">
+            <PostHogPageView />
+            <Outlet />
+
+            {hasFatalErrors && pathname !== ROUTES.CONFIG_ERROR && (
+              <div
+                className="z-50 cursor-pointer bg-red-600 p-4 text-center text-white"
+                role="alert"
+                onClick={() => navigate(ROUTES.CONFIG_ERROR)}
+              >
+                <strong className="font-bold">Error!</strong>{" "}
+                <span className="block sm:inline">Could not load config</span>
+                <div className="mt-2 underline">Learn More</div>
+              </div>
+            )}
+            <Footer />
+          </GridDiv>
+        </div>
+        <div
+          style={{ fontSize: `${getFontSize() - 4}px` }}
+          id="tooltip-portal-div"
+        />
+      </LayoutTopDiv>
+    </AuthProvider>
   );
 };
 
