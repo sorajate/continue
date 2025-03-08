@@ -1,13 +1,17 @@
-import { Analytics } from "@continuedev/config-types";
 import os from "node:os";
+
 import ContinueProxyAnalyticsProvider from "./analytics/ContinueProxyAnalyticsProvider.js";
-import { IAnalyticsProvider } from "./analytics/IAnalyticsProvider.js";
+import {
+  ControlPlaneProxyInfo,
+  IAnalyticsProvider,
+} from "./analytics/IAnalyticsProvider.js";
 import LogStashAnalyticsProvider from "./analytics/LogStashAnalyticsProvider.js";
 import PostHogAnalyticsProvider from "./analytics/PostHogAnalyticsProvider.js";
 import { ControlPlaneClient } from "./client.js";
+import { AnalyticsConfig } from "../index.js";
 
 function createAnalyticsProvider(
-  config: Analytics,
+  config: AnalyticsConfig,
 ): IAnalyticsProvider | undefined {
   // @ts-ignore
   switch (config.provider) {
@@ -29,7 +33,7 @@ export class TeamAnalytics {
   static extensionVersion: string | undefined = undefined;
 
   static async capture(event: string, properties: { [key: string]: any }) {
-    TeamAnalytics.provider?.capture(event, {
+    void TeamAnalytics.provider?.capture(event, {
       ...properties,
       os: TeamAnalytics.os,
       extensionVersion: TeamAnalytics.extensionVersion,
@@ -37,28 +41,37 @@ export class TeamAnalytics {
   }
 
   static async setup(
-    config: Analytics,
+    config: AnalyticsConfig,
     uniqueId: string,
     extensionVersion: string,
     controlPlaneClient: ControlPlaneClient,
-    workspaceId?: string,
+    controlPlaneProxyInfo: ControlPlaneProxyInfo,
   ) {
     TeamAnalytics.uniqueId = uniqueId;
     TeamAnalytics.os = os.platform();
     TeamAnalytics.extensionVersion = extensionVersion;
 
-    if (!config) {
-      await TeamAnalytics.provider?.shutdown();
-      TeamAnalytics.provider = undefined;
-    } else {
-      TeamAnalytics.provider = createAnalyticsProvider(config);
-      await TeamAnalytics.provider?.setup(config, uniqueId, workspaceId);
+    TeamAnalytics.provider = createAnalyticsProvider(config);
+    await TeamAnalytics.provider?.setup(
+      config,
+      uniqueId,
+      controlPlaneProxyInfo,
+    );
 
-      if (config.provider === "continue-proxy") {
-        (
-          TeamAnalytics.provider as ContinueProxyAnalyticsProvider
-        ).controlPlaneClient = controlPlaneClient;
-      }
+    if (config.provider === "continue-proxy") {
+      (
+        TeamAnalytics.provider as ContinueProxyAnalyticsProvider
+      ).controlPlaneClient = controlPlaneClient;
+    }
+  }
+
+  static async shutdown() {
+    if (TeamAnalytics.provider) {
+      await TeamAnalytics.provider.shutdown();
+      TeamAnalytics.provider = undefined;
+      TeamAnalytics.os = undefined;
+      TeamAnalytics.extensionVersion = undefined;
+      TeamAnalytics.uniqueId = "NOT_UNIQUE";
     }
   }
 }

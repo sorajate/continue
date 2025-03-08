@@ -3,28 +3,28 @@ import { useContext } from "react";
 import { useDispatch } from "react-redux";
 import { Button, ButtonSubtext } from "../..";
 import { IdeMessengerContext } from "../../../context/IdeMessenger";
-import { setDefaultModel } from "../../../redux/slices/stateSlice";
-import {
-  setDialogMessage,
-  setShowDialog,
-} from "../../../redux/slices/uiStateSlice";
+import { setDialogMessage, setShowDialog } from "../../../redux/slices/uiSlice";
 import { isJetBrains } from "../../../util";
 import { useSubmitOnboarding } from "../hooks";
 import JetBrainsFetchGitHubTokenDialog from "./JetBrainsFetchGitHubTokenDialog";
+import { setDefaultModel } from "../../../redux/slices/configSlice";
 
-function QuickstartSubmitButton() {
+interface QuickstartSubmitButtonProps {
+  isDialog?: boolean;
+}
+
+function QuickstartSubmitButton({ isDialog }: QuickstartSubmitButtonProps) {
   const ideMessenger = useContext(IdeMessengerContext);
   const dispatch = useDispatch();
 
-  const { submitOnboarding } = useSubmitOnboarding("Quickstart");
+  const { submitOnboarding } = useSubmitOnboarding("Quickstart", isDialog);
 
   function onComplete() {
     submitOnboarding();
 
     // Set Sonnet as the default model
-    dispatch(
-      setDefaultModel({ title: FREE_TRIAL_MODELS[0].title, force: true }),
-    );
+    const title = FREE_TRIAL_MODELS[0].title;
+    dispatch(setDefaultModel({ title, force: true }));
   }
 
   function openJetBrainsDialog() {
@@ -40,8 +40,14 @@ function QuickstartSubmitButton() {
     const result = await ideMessenger.request("getGitHubAuthToken", {
       force: true,
     });
+
     if (result.status === "success") {
       onComplete();
+    } else {
+      ideMessenger.post("showToast", [
+        "error",
+        "Failed to sign up for Continue free trial through GitHub",
+      ]);
     }
   }
 
@@ -57,7 +63,7 @@ function QuickstartSubmitButton() {
     <div className="mt-4 w-full">
       <Button
         onClick={onClick}
-        className="grid grid-flow-col items-center gap-2 w-full"
+        className="grid w-full grid-flow-col items-center gap-2"
       >
         Get started using our API keys
       </Button>

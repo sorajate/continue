@@ -1,7 +1,12 @@
+import * as fs from "node:fs";
+
+import { ConfigResult, FullSlug } from "@continuedev/config-yaml";
+
 import {
   ControlPlaneClient,
   ControlPlaneSessionInfo,
 } from "../control-plane/client.js";
+import { getControlPlaneEnv, useHub } from "../control-plane/env.js";
 import {
   BrowserSerializedContinueConfig,
   ContinueConfig,
@@ -12,197 +17,314 @@ import {
 } from "../index.js";
 import Ollama from "../llm/llms/Ollama.js";
 import { GlobalContext } from "../util/GlobalContext.js";
-import { finalToBrowserConfig } from "./load.js";
+import { getConfigJsonPath, getConfigYamlPath } from "../util/paths.js";
+import { localPathToUri } from "../util/pathToUri.js";
+
 import {
   LOCAL_ONBOARDING_CHAT_MODEL,
-  ONBOARDING_LOCAL_MODEL_TITLE,
+  LOCAL_ONBOARDING_PROVIDER_TITLE,
 } from "./onboarding.js";
 import ControlPlaneProfileLoader from "./profile/ControlPlaneProfileLoader.js";
-import { IProfileLoader } from "./profile/IProfileLoader.js";
 import LocalProfileLoader from "./profile/LocalProfileLoader.js";
+import PlatformProfileLoader from "./profile/PlatformProfileLoader.js";
+import {
+  ProfileDescription,
+  ProfileLifecycleManager,
+} from "./ProfileLifecycleManager.js";
 
-export interface ProfileDescription {
-  title: string;
-  id: string;
-}
+export type { ProfileDescription };
+
+type ConfigUpdateFunction = (payload: ConfigResult<ContinueConfig>) => void;
 
 // Separately manages saving/reloading each profile
-class ProfileLifecycleManager {
-  private savedConfig: ContinueConfig | undefined;
-  private savedBrowserConfig?: BrowserSerializedContinueConfig;
-  private pendingConfigPromise?: Promise<ContinueConfig>;
-
-  constructor(private readonly profileLoader: IProfileLoader) {}
-
-  get profileId() {
-    return this.profileLoader.profileId;
-  }
-
-  get profileTitle() {
-    return this.profileLoader.profileTitle;
-  }
-
-  get profileDescription(): ProfileDescription {
-    return {
-      title: this.profileTitle,
-      id: this.profileId,
-    };
-  }
-
-  clearConfig() {
-    this.savedConfig = undefined;
-    this.savedBrowserConfig = undefined;
-    this.pendingConfigPromise = undefined;
-  }
-
-  // Clear saved config and reload
-  async reloadConfig(): Promise<ContinueConfig> {
-    this.savedConfig = undefined;
-    this.savedBrowserConfig = undefined;
-    this.pendingConfigPromise = undefined;
-
-    return await this.profileLoader.doLoadConfig();
-  }
-
-  async loadConfig(
-    additionalContextProviders: IContextProvider[],
-  ): Promise<ContinueConfig> {
-    // If we already have a config, return it
-    if (this.savedConfig) {
-      return this.savedConfig;
-    } else if (this.pendingConfigPromise) {
-      return this.pendingConfigPromise;
-    }
-
-    // Set pending config promise
-    this.pendingConfigPromise = new Promise(async (resolve, reject) => {
-      const newConfig = await this.profileLoader.doLoadConfig();
-
-      // Add registered context providers
-      newConfig.contextProviders = (newConfig.contextProviders ?? []).concat(
-        additionalContextProviders,
-      );
-
-      this.savedConfig = newConfig;
-      resolve(newConfig);
-    });
-
-    // Wait for the config promise to resolve
-    this.savedConfig = await this.pendingConfigPromise;
-    this.pendingConfigPromise = undefined;
-    return this.savedConfig;
-  }
-
-  async getSerializedConfig(
-    additionalContextProviders: IContextProvider[],
-  ): Promise<BrowserSerializedContinueConfig> {
-    if (!this.savedBrowserConfig) {
-      const continueConfig = await this.loadConfig(additionalContextProviders);
-      this.savedBrowserConfig = finalToBrowserConfig(continueConfig);
-    }
-    return this.savedBrowserConfig;
-  }
-}
 
 export class ConfigHandler {
   private readonly globalContext = new GlobalContext();
   private additionalContextProviders: IContextProvider[] = [];
-  private profiles: ProfileLifecycleManager[];
-  private selectedProfileId: string;
+  private profiles: ProfileLifecycleManager[] | null = null; // null until profiles are loaded
+  private selectedProfileId: string | null = null;
+  private localProfileManager: ProfileLifecycleManager;
+  controlPlaneClient: ControlPlaneClient;
+
+  initializedPromise: Promise<void>;
 
   constructor(
     private readonly ide: IDE,
     private ideSettingsPromise: Promise<IdeSettings>,
     private readonly writeLog: (text: string) => Promise<void>,
-    private controlPlaneClient: ControlPlaneClient,
+    sessionInfoPromise: Promise<ControlPlaneSessionInfo | undefined>,
   ) {
     this.ide = ide;
     this.ideSettingsPromise = ideSettingsPromise;
     this.writeLog = writeLog;
+    this.controlPlaneClient = new ControlPlaneClient(
+      sessionInfoPromise,
+      ideSettingsPromise,
+    );
 
     // Set local profile as default
     const localProfileLoader = new LocalProfileLoader(
       ide,
       ideSettingsPromise,
-      controlPlaneClient,
+      this.controlPlaneClient,
       writeLog,
     );
-    this.profiles = [new ProfileLifecycleManager(localProfileLoader)];
-    this.selectedProfileId = localProfileLoader.profileId;
+    this.localProfileManager = new ProfileLifecycleManager(
+      localProfileLoader,
+      this.ide,
+    );
 
-    // Always load local profile immediately in case control plane doesn't load
+    // Profiles are loaded asynchronously
+    this.initializedPromise = new Promise((resolve, reject) => {
+      this.init()
+        .then(() => {
+          resolve();
+        })
+        .catch((e) => {
+          reject(e);
+        });
+    });
+  }
+
+  /**
+   * Retrieves the titles of additional context providers that are of type "submenu".
+   *
+   * @returns {string[]} An array of titles of the additional context providers that have a description type of "submenu".
+   */
+  getAdditionalSubmenuContextProviders(): string[] {
+    return this.additionalContextProviders
+      .filter((provider) => provider.description.type === "submenu")
+      .map((provider) => provider.description.title);
+  }
+
+  private async init() {
     try {
-      this.loadConfig();
+      await this.fetchControlPlaneProfiles();
+    } catch (e) {
+      // If this fails, make sure at least local profile is loaded
+      console.error("Failed to fetch control plane profiles in init: ", e);
+      await this.updateAvailableProfiles([this.localProfileManager]);
+    }
+    try {
+      const configResult = await this.loadConfig();
+      this.notifyConfigListeners(configResult);
     } catch (e) {
       console.error("Failed to load config: ", e);
     }
-
-    // Load control plane profiles
-    this.fetchControlPlaneProfiles();
-  }
-
-  // This will be the local profile
-  private get fallbackProfile() {
-    return this.profiles[0];
   }
 
   get currentProfile() {
+    if (!this.selectedProfileId) {
+      return null;
+    }
+    // IMPORTANT
+    // We must fall back to null, not the first or local profiles
+    // Because GUI must be the source of truth for selected profile
     return (
-      this.profiles.find((p) => p.profileId === this.selectedProfileId) ??
-      this.fallbackProfile
+      this.profiles?.find(
+        (p) => p.profileDescription.id === this.selectedProfileId,
+      ) ?? null
     );
   }
 
   get inactiveProfiles() {
-    return this.profiles.filter((p) => p.profileId !== this.selectedProfileId);
+    return (this.profiles ?? []).filter(
+      (p) => p.profileDescription.id !== this.selectedProfileId,
+    );
   }
 
-  private async fetchControlPlaneProfiles() {
+  async openConfigProfile(profileId?: string) {
+    let openProfileId = profileId || this.selectedProfileId;
+    if (openProfileId === "local") {
+      const ideInfo = await this.ide.getIdeInfo();
+      const configYamlPath = getConfigYamlPath(ideInfo.ideType);
+      if (fs.existsSync(configYamlPath)) {
+        await this.ide.openFile(localPathToUri(configYamlPath));
+      } else {
+        await this.ide.openFile(localPathToUri(getConfigJsonPath()));
+      }
+    } else {
+      const env = await getControlPlaneEnv(this.ide.getIdeSettings());
+      await this.ide.openUrl(`${env.APP_URL}${openProfileId}`);
+    }
+  }
+
+  async listOrganizations() {
+    return await this.controlPlaneClient.listOrganizations();
+  }
+
+  async loadAssistantsForSelectedOrg() {
     // Get the profiles and create their lifecycle managers
-    this.controlPlaneClient.listWorkspaces().then(async (workspaces) => {
-      this.profiles = this.profiles.filter(
-        (profile) => profile.profileId === "local",
-      );
-      workspaces.forEach((workspace) => {
-        const profileLoader = new ControlPlaneProfileLoader(
-          workspace.id,
-          workspace.name,
+    const userId = await this.controlPlaneClient.userId;
+    const selectedOrgId = await this.getSelectedOrgId();
+
+    let profiles: ProfileLifecycleManager[] | null = null;
+    if (!userId) {
+      // Not logged in
+      profiles = [this.localProfileManager];
+    } else {
+      // Logged in
+      const assistants =
+        await this.controlPlaneClient.listAssistants(selectedOrgId);
+
+      const hubProfiles = assistants.map((assistant) => {
+        const profileLoader = new PlatformProfileLoader(
+          {
+            ...assistant.configResult,
+            config: assistant.configResult.config,
+          },
+          assistant.ownerSlug,
+          assistant.packageSlug,
+          assistant.iconUrl,
+          assistant.configResult.config?.version ?? "latest",
           this.controlPlaneClient,
           this.ide,
           this.ideSettingsPromise,
           this.writeLog,
           this.reloadConfig.bind(this),
         );
-        this.profiles.push(new ProfileLifecycleManager(profileLoader));
+
+        return new ProfileLifecycleManager(profileLoader, this.ide);
       });
 
-      this.notifyProfileListeners(
-        this.profiles.map((profile) => profile.profileDescription),
-      );
-
-      // Check the last selected workspace, and reload if it isn't local
-      const workspaceId = await this.getWorkspaceId();
-      const lastSelectedWorkspaceIds =
-        this.globalContext.get("lastSelectedProfileForWorkspace") ?? {};
-      const selectedWorkspaceId = lastSelectedWorkspaceIds[workspaceId];
-      if (selectedWorkspaceId) {
-        this.selectedProfileId = selectedWorkspaceId;
-        this.loadConfig();
+      if (selectedOrgId === null) {
+        // Personal
+        profiles = [...hubProfiles, this.localProfileManager];
       } else {
-        // Otherwise we stick with local profile, and record choice
-        lastSelectedWorkspaceIds[workspaceId] = this.selectedProfileId;
-        this.globalContext.update(
-          "lastSelectedProfileForWorkspace",
-          lastSelectedWorkspaceIds,
-        );
+        // Organization
+        profiles = hubProfiles;
       }
-    });
+    }
+
+    await this.updateAvailableProfiles(profiles);
   }
 
-  async setSelectedProfile(profileId: string) {
+  private async updateAvailableProfiles(profiles: ProfileLifecycleManager[]) {
+    this.profiles = profiles;
+
+    // If the last selected profile is in the list choose that
+    // Otherwise, choose the first profile
+    const previouslySelectedProfileId =
+      await this.getPersistedSelectedProfileId();
+
+    // Check if the previously selected profile exists in the current profiles
+    const profileExists = profiles.some(
+      (profile) =>
+        profile.profileDescription.id === previouslySelectedProfileId,
+    );
+
+    const selectedProfileId = profileExists
+      ? previouslySelectedProfileId
+      : (profiles[0]?.profileDescription.id ?? null);
+
+    // Notify listeners
+    const profileDescriptions = profiles.map(
+      (profile) => profile.profileDescription,
+    );
+    this.notifyProfileListeners(profileDescriptions, selectedProfileId);
+    await this.setSelectedProfile(selectedProfileId);
+  }
+
+  private platformProfilesRefreshInterval: NodeJS.Timeout | undefined;
+  // We use this to keep track of whether we should reload the assistants
+  private lastFullSlugsList: FullSlug[] = [];
+
+  private fullSlugsListsDiffer(a: FullSlug[], b: FullSlug[]): boolean {
+    if (a.length !== b.length) {
+      return true;
+    }
+    for (let i = 0; i < a.length; i++) {
+      if (a[i].ownerSlug !== b[i].ownerSlug) {
+        return true;
+      }
+      if (a[i].packageSlug !== b[i].packageSlug) {
+        return true;
+      }
+      if (a[i].versionSlug !== b[i].versionSlug) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private async reloadHubAssistants() {
+    const selectedOrgId = await this.getSelectedOrgId();
+    const newFullSlugsList =
+      await this.controlPlaneClient.listAssistantFullSlugs(selectedOrgId);
+
+    if (newFullSlugsList) {
+      const shouldReload = this.fullSlugsListsDiffer(
+        newFullSlugsList,
+        this.lastFullSlugsList,
+      );
+      if (shouldReload) {
+        await this.loadAssistantsForSelectedOrg();
+      }
+      this.lastFullSlugsList = newFullSlugsList;
+    }
+  }
+
+  private async fetchControlPlaneProfiles() {
+    if (await useHub(this.ideSettingsPromise)) {
+      clearInterval(this.platformProfilesRefreshInterval);
+      await this.loadAssistantsForSelectedOrg();
+
+      // Every 5 seconds we ask the platform whether there are any assistant updates in the last 5 seconds
+      // If so, we do the full (more expensive) reload
+      this.platformProfilesRefreshInterval = setInterval(
+        this.reloadHubAssistants.bind(this),
+        PlatformProfileLoader.RELOAD_INTERVAL,
+      );
+    } else {
+      try {
+        const workspaces = await this.controlPlaneClient.listWorkspaces();
+        const profiles = [this.localProfileManager];
+        workspaces.forEach((workspace) => {
+          const profileLoader = new ControlPlaneProfileLoader(
+            workspace.id,
+            workspace.name,
+            this.controlPlaneClient,
+            this.ide,
+            this.ideSettingsPromise,
+            this.writeLog,
+            this.reloadConfig.bind(this),
+          );
+
+          profiles.push(new ProfileLifecycleManager(profileLoader, this.ide));
+        });
+
+        await this.updateAvailableProfiles(profiles);
+      } catch (e: any) {
+        console.error("Failed to load profiles: ", e);
+        await this.updateAvailableProfiles([this.localProfileManager]);
+      }
+    }
+  }
+
+  async getPersistedSelectedProfileId(): Promise<string | null> {
+    const workspaceId = await this.getWorkspaceId();
+    const lastSelectedIds =
+      this.globalContext.get("lastSelectedProfileForWorkspace") ?? {};
+    return lastSelectedIds[workspaceId] ?? null;
+  }
+
+  async getSelectedOrgId(): Promise<string | null> {
+    const selectedOrgs =
+      this.globalContext.get("lastSelectedOrgIdForWorkspace") ?? {};
+    return selectedOrgs[await this.getWorkspaceId()] ?? null;
+  }
+
+  async setSelectedOrgId(orgId: string | null) {
+    const selectedOrgs =
+      this.globalContext.get("lastSelectedOrgIdForWorkspace") ?? {};
+    selectedOrgs[await this.getWorkspaceId()] = orgId;
+    this.globalContext.update("lastSelectedOrgIdForWorkspace", selectedOrgs);
+  }
+
+  async setSelectedProfile(profileId: string | null) {
     this.selectedProfileId = profileId;
-    const newConfig = await this.loadConfig();
-    this.notifyConfigListeners(newConfig);
+    const result = await this.loadConfig();
+    this.notifyConfigListeners(result);
     const selectedProfiles =
       this.globalContext.get("lastSelectedProfileForWorkspace") ?? {};
     selectedProfiles[await this.getWorkspaceId()] = profileId;
@@ -221,79 +343,123 @@ export class ConfigHandler {
   // Automatically refresh config when Continue-related IDE (e.g. VS Code) settings are changed
   updateIdeSettings(ideSettings: IdeSettings) {
     this.ideSettingsPromise = Promise.resolve(ideSettings);
-    this.reloadConfig();
+    void this.reloadConfig();
   }
 
-  updateControlPlaneSessionInfo(
+  async updateControlPlaneSessionInfo(
     sessionInfo: ControlPlaneSessionInfo | undefined,
   ) {
     this.controlPlaneClient = new ControlPlaneClient(
       Promise.resolve(sessionInfo),
+      this.ideSettingsPromise,
     );
-    this.fetchControlPlaneProfiles().catch((e) => {
+    this.fetchControlPlaneProfiles().catch(async (e) => {
       console.error("Failed to fetch control plane profiles: ", e);
+      await this.updateAvailableProfiles([this.localProfileManager]);
+      await this.reloadConfig();
     });
   }
 
-  private profilesListeners: ((profiles: ProfileDescription[]) => void)[] = [];
+  private profilesListeners: ((
+    profiles: ProfileDescription[],
+    selectedProfileId: string | null,
+  ) => void)[] = [];
   onDidChangeAvailableProfiles(
-    listener: (profiles: ProfileDescription[]) => void,
+    listener: (
+      profiles: ProfileDescription[],
+      selectedProfileId: string | null,
+    ) => void,
   ) {
     this.profilesListeners.push(listener);
   }
 
-  private notifyProfileListeners(profiles: ProfileDescription[]) {
+  private notifyProfileListeners(
+    profiles: ProfileDescription[],
+    selectedProfileId: string | null,
+  ) {
     for (const listener of this.profilesListeners) {
-      listener(profiles);
+      listener(profiles, selectedProfileId);
     }
   }
 
-  private notifyConfigListeners(newConfig: ContinueConfig) {
+  private notifyConfigListeners(result: ConfigResult<ContinueConfig>) {
     // Notify listeners that config changed
     for (const listener of this.updateListeners) {
-      listener(newConfig);
+      listener(result);
     }
   }
 
-  private updateListeners: ((newConfig: ContinueConfig) => void)[] = [];
-  onConfigUpdate(listener: (newConfig: ContinueConfig) => void) {
+  private updateListeners: ConfigUpdateFunction[] = [];
+
+  onConfigUpdate(listener: ConfigUpdateFunction) {
     this.updateListeners.push(listener);
   }
 
+  // TODO: this isn't right, there are two different senses in which you want to "reload"
   async reloadConfig() {
-    // TODO: this isn't right, there are two different senses in which you want to "reload"
-    const newConfig = await this.currentProfile.reloadConfig();
-    this.inactiveProfiles.forEach((profile) => profile.clearConfig());
-    this.notifyConfigListeners(newConfig);
-    return newConfig;
+    if (!this.currentProfile) {
+      return {
+        config: undefined,
+        errors: [],
+        configLoadInterrupted: true,
+      };
+    }
+
+    const { config, errors, configLoadInterrupted } =
+      await this.currentProfile.reloadConfig(this.additionalContextProviders);
+
+    if (config) {
+      this.inactiveProfiles.forEach((profile) => profile.clearConfig());
+    }
+
+    this.notifyConfigListeners({ config, errors, configLoadInterrupted });
+    return { config, errors, configLoadInterrupted };
   }
 
-  getSerializedConfig(): Promise<BrowserSerializedContinueConfig> {
-    return this.currentProfile.getSerializedConfig(
+  async getSerializedConfig(): Promise<
+    ConfigResult<BrowserSerializedContinueConfig>
+  > {
+    if (!this.currentProfile) {
+      return {
+        config: undefined,
+        errors: [],
+        configLoadInterrupted: true,
+      };
+    }
+    return await this.currentProfile.getSerializedConfig(
       this.additionalContextProviders,
     );
   }
 
-  listProfiles(): ProfileDescription[] {
-    return this.profiles.map((p) => p.profileDescription);
+  listProfiles(): ProfileDescription[] | null {
+    return this.profiles?.map((p) => p.profileDescription) ?? null;
   }
 
-  async loadConfig(): Promise<ContinueConfig> {
-    return this.currentProfile.loadConfig(this.additionalContextProviders);
+  async loadConfig(): Promise<ConfigResult<ContinueConfig>> {
+    if (!this.currentProfile) {
+      return {
+        config: undefined,
+        errors: [],
+        configLoadInterrupted: true,
+      };
+    }
+    return await this.currentProfile.loadConfig(
+      this.additionalContextProviders,
+    );
   }
 
   async llmFromTitle(title?: string): Promise<ILLM> {
-    const config = await this.loadConfig();
-    const model = config.models.find((m) => m.title === title);
+    const { config } = await this.loadConfig();
+    const model = config?.models.find((m) => m.title === title);
     if (!model) {
-      if (title === ONBOARDING_LOCAL_MODEL_TITLE) {
+      if (title === LOCAL_ONBOARDING_PROVIDER_TITLE) {
         // Special case, make calls to Ollama before we have it in the config
         const ollama = new Ollama({
           model: LOCAL_ONBOARDING_CHAT_MODEL,
         });
         return ollama;
-      } else if (config.models.length > 0) {
-        return config.models[0];
+      } else if (config?.models?.length) {
+        return config?.models[0];
       }
 
       throw new Error("No model found");
@@ -304,6 +470,6 @@ export class ConfigHandler {
 
   registerCustomContextProvider(contextProvider: IContextProvider) {
     this.additionalContextProviders.push(contextProvider);
-    this.reloadConfig();
+    void this.reloadConfig();
   }
 }

@@ -1,27 +1,26 @@
 import ignore, { Ignore } from "ignore";
-import path from "node:path";
-import { FileType, IDE } from "../index.d.js";
+
+import type { FileType, IDE } from "..";
+
+import { joinPathsToUri } from "../util/uri";
 import {
-  DEFAULT_IGNORE_DIRS,
-  DEFAULT_IGNORE_FILETYPES,
-  defaultIgnoreDir,
-  defaultIgnoreFile,
+  defaultIgnoreFileAndDir,
+  getGlobalContinueIgArray,
   gitIgArrayFromFile,
-} from "./ignore.js";
+} from "./ignore";
 
 export interface WalkerOptions {
-  ignoreFiles?: string[];
   onlyDirs?: boolean;
-  returnRelativePaths?: boolean;
-  additionalIgnoreRules?: string[];
+  returnRelativeUrisPaths?: boolean;
 }
 
 type Entry = [string, FileType];
 
 // helper struct used for the DFS walk
 type WalkableEntry = {
-  relPath: string;
-  absPath: string;
+  name: string;
+  relativeUriPath: string;
+  uri: string;
   type: FileType;
   entry: Entry;
 };
@@ -38,141 +37,110 @@ type IgnoreContext = {
 };
 
 class DFSWalker {
-  private readonly path: string;
-  private readonly ide: IDE;
-  private readonly options: WalkerOptions;
-  private readonly ignoreFileNames: Set<string>;
-
-  constructor(path: string, ide: IDE, options: WalkerOptions) {
-    this.path = path;
-    this.ide = ide;
-    this.options = options;
-    this.ignoreFileNames = new Set<string>(options.ignoreFiles);
-  }
+  constructor(
+    private readonly uri: string,
+    private readonly ide: IDE,
+    private readonly options: WalkerOptions,
+  ) {}
 
   // walk is a depth-first search implementation
   public async *walk(): AsyncGenerator<string> {
-    const fixupFunc = await this.newPathFixupFunc(
-      this.options.returnRelativePaths ? "" : this.path,
-      this.ide,
-    );
-    const root = this.newRootWalkContext();
-    const stack = [root];
-    for (let cur = stack.pop(); cur; cur = stack.pop()) {
-      const walkableEntries = await this.listDirForWalking(cur.walkableEntry);
-      const ignoreContexts = await this.getIgnoreToApplyInDir(
-        cur,
-        walkableEntries,
-      );
-      for (const w of walkableEntries) {
-        if (!this.shouldInclude(w, ignoreContexts)) {
-          continue;
-        }
-        if (this.entryIsDirectory(w.entry)) {
-          stack.push({
-            walkableEntry: w,
-            ignoreContexts: ignoreContexts,
-          });
-          if (this.options.onlyDirs) {
-            // when onlyDirs is enabled the walker will only return directory names
-            yield fixupFunc(w.relPath);
-          }
-        } else {
-          yield fixupFunc(w.relPath);
-        }
-      }
-    }
-  }
+    const defaultAndGlobalIgnores = ignore()
+      .add(defaultIgnoreFileAndDir)
+      .add(getGlobalContinueIgArray());
 
-  private newRootWalkContext(): WalkContext {
-    return {
+    const rootContext: WalkContext = {
       walkableEntry: {
-        relPath: "",
-        absPath: this.path,
+        name: "",
+        relativeUriPath: "",
+        uri: this.uri,
         type: 2 as FileType.Directory,
         entry: ["", 2 as FileType.Directory],
       },
-      ignoreContexts: [
+      ignoreContexts: [],
+    };
+    const stack = [rootContext];
+
+    for (let cur = stack.pop(); cur; cur = stack.pop()) {
+      // Only directories will be added to the stack
+      const entries = await this.ide.listDir(cur.walkableEntry.uri);
+
+      const newIgnore = await getIgnoreContext(
+        cur.walkableEntry.uri,
+        entries,
+        this.ide,
+        defaultAndGlobalIgnores,
+      );
+
+      const ignoreContexts = [
+        ...cur.ignoreContexts,
         {
-          ignore: ignore().add(defaultIgnoreDir).add(defaultIgnoreFile),
-          dirname: "",
+          ignore: newIgnore,
+          dirname: cur.walkableEntry.relativeUriPath,
         },
-      ],
-    };
-  }
+      ];
 
-  private async listDirForWalking(
-    walkableEntry: WalkableEntry,
-  ): Promise<WalkableEntry[]> {
-    const entries = await this.ide.listDir(walkableEntry.absPath);
-    return entries.map((e) => {
-      return {
-        relPath: path.join(walkableEntry.relPath, e[0]),
-        absPath: path.join(walkableEntry.absPath, e[0]),
-        type: e[1],
-        entry: e,
-      };
-    });
-  }
+      for (const entry of entries) {
+        if (this.entryIsSymlink(entry)) {
+          // If called from the root, a symlink either links to a real file in this repository,
+          // and therefore will be walked OR it links to something outside of the repository and
+          // we do not want to index it
+          continue;
+        }
+        const walkableEntry = {
+          name: entry[0],
+          relativeUriPath: `${cur.walkableEntry.relativeUriPath}${cur.walkableEntry.relativeUriPath ? "/" : ""}${entry[0]}`,
+          uri: joinPathsToUri(cur.walkableEntry.uri, entry[0]),
+          type: entry[1],
+          entry: entry,
+        };
 
-  private async getIgnoreToApplyInDir(
-    curDir: WalkContext,
-    entriesInDir: WalkableEntry[],
-  ): Promise<IgnoreContext[]> {
-    const ignoreFilesInDir = await this.loadIgnoreFiles(entriesInDir);
-    if (ignoreFilesInDir.length === 0) {
-      return curDir.ignoreContexts;
-    }
-    const patterns = ignoreFilesInDir.map((c) => gitIgArrayFromFile(c)).flat();
-    const newIgnoreContext = {
-      ignore: ignore().add(patterns),
-      dirname: curDir.walkableEntry.relPath,
-    };
-    return [
-      ...curDir.ignoreContexts,
-      newIgnoreContext
-    ];
-  }
+        let relPath = walkableEntry.relativeUriPath;
+        if (this.entryIsDirectory(entry)) {
+          relPath = `${relPath}/`;
+        } else {
+          if (this.options.onlyDirs) {
+            continue;
+          }
+        }
+        let shouldInclude = true;
+        for (const ig of ignoreContexts) {
+          // remove the directory name and path separator from the match path, unless this an ignore file
+          // in the root directory
+          const prefixLength =
+            ig.dirname.length === 0 ? 0 : ig.dirname.length + 1;
+          // The ignore library expects a path relative to the ignore file location
+          const matchPath = relPath.substring(prefixLength);
+          if (ig.ignore.ignores(matchPath)) {
+            shouldInclude = false;
+          }
+        }
+        if (!shouldInclude) {
+          continue;
+        }
 
-  private async loadIgnoreFiles(entries: WalkableEntry[]): Promise<string[]> {
-    const ignoreEntries = entries.filter((w) => this.isIgnoreFile(w.entry));
-    const promises = ignoreEntries.map(async (w) => {
-      return await this.ide.readFile(w.absPath);
-    });
-    return Promise.all(promises);
-  }
-
-  private isIgnoreFile(e: Entry): boolean {
-    const p = e[0];
-    return this.ignoreFileNames.has(p);
-  }
-
-  private shouldInclude(walkableEntry: WalkableEntry, ignoreContexts: IgnoreContext[]) {
-    if (this.entryIsSymlink(walkableEntry.entry)) {
-      // If called from the root, a symlink either links to a real file in this repository,
-      // and therefore will be walked OR it linksto something outside of the repository and
-      // we do not want to index it
-      return false;
-    }
-    let relPath = walkableEntry.relPath;
-    if (this.entryIsDirectory(walkableEntry.entry)) {
-      relPath = `${relPath}/`;
-    } else {
-      if (this.options.onlyDirs) {
-        return false;
+        if (this.entryIsDirectory(entry)) {
+          stack.push({
+            walkableEntry,
+            ignoreContexts,
+          });
+          if (this.options.onlyDirs) {
+            // when onlyDirs is enabled the walker will only return directory names
+            if (this.options.returnRelativeUrisPaths) {
+              yield walkableEntry.relativeUriPath;
+            } else {
+              yield walkableEntry.uri;
+            }
+          }
+        } else {
+          if (this.options.returnRelativeUrisPaths) {
+            yield walkableEntry.relativeUriPath;
+          } else {
+            yield walkableEntry.uri;
+          }
+        }
       }
     }
-    for (const ig of ignoreContexts) {
-      // remove the directory name and path seperator from the match path, unless this an ignore file
-      // in the root directory
-      const prefixLength = ig.dirname.length === 0 ? 0 : ig.dirname.length + 1;
-      // The ignore library expects a path relative to the ignore file location
-      const matchPath = relPath.substring(prefixLength);
-      if (ig.ignore.ignores(matchPath)) {
-        return false;
-      }
-    }
-    return true;
   }
 
   private entryIsDirectory(entry: Entry) {
@@ -182,51 +150,88 @@ class DFSWalker {
   private entryIsSymlink(entry: Entry) {
     return entry[1] === (64 as FileType.SymbolicLink);
   }
-
-  // returns a function which will optionally prefix a root path and fixup the paths for the appropriate OS filesystem (i.e. windows)
-  // the reason to construct this function once is to avoid the need to call ide.pathSep() multiple times
-  private async newPathFixupFunc(
-    rootPath: string,
-    ide: IDE,
-  ): Promise<(relPath: string) => string> {
-    const pathSep = await ide.pathSep();
-    const prefix = rootPath === "" ? "" : rootPath + pathSep;
-    if (pathSep === "/") {
-      if (rootPath === "") {
-        // return a no-op function in this case to avoid unnecessary string concatentation
-        return (relPath: string) => relPath;
-      }
-      return (relPath: string) => prefix + relPath;
-    }
-    // this serves to 'fix-up' the path on Windows
-    return (relPath: string) => {
-      return prefix + relPath.split("/").join(pathSep);
-    };
-  }
 }
 
 const defaultOptions: WalkerOptions = {
-  ignoreFiles: [".gitignore", ".continueignore"],
-  additionalIgnoreRules: [...DEFAULT_IGNORE_DIRS, ...DEFAULT_IGNORE_FILETYPES],
+  onlyDirs: false,
+  returnRelativeUrisPaths: false,
 };
 
 export async function walkDir(
-  path: string,
+  uri: string,
   ide: IDE,
-  _options?: WalkerOptions,
+  _optionOverrides?: WalkerOptions,
 ): Promise<string[]> {
-  let paths: string[] = [];
-  for await (const p of walkDirAsync(path, ide, _options)) {
-    paths.push(p);
+  let urisOrRelativePaths: string[] = [];
+  for await (const p of walkDirAsync(uri, ide, _optionOverrides)) {
+    urisOrRelativePaths.push(p);
   }
-  return paths;
+  return urisOrRelativePaths;
 }
 
 export async function* walkDirAsync(
   path: string,
   ide: IDE,
-  _options?: WalkerOptions,
+  _optionOverrides?: WalkerOptions,
 ): AsyncGenerator<string> {
-  const options = { ...defaultOptions, ..._options };
+  const options = { ...defaultOptions, ..._optionOverrides };
   yield* new DFSWalker(path, ide, options).walk();
+}
+
+export async function walkDirs(
+  ide: IDE,
+  _optionOverrides?: WalkerOptions,
+  dirs?: string[], // Can pass dirs to prevent duplicate calls
+): Promise<string[]> {
+  const workspaceDirs = dirs ?? (await ide.getWorkspaceDirs());
+  const results = await Promise.all(
+    workspaceDirs.map((dir) => walkDir(dir, ide, _optionOverrides)),
+  );
+  return results.flat();
+}
+
+export async function getIgnoreContext(
+  currentDir: string,
+  currentDirEntries: Entry[],
+  ide: IDE,
+  defaultAndGlobalIgnores: Ignore,
+) {
+  const dirFiles = currentDirEntries
+    .filter(([_, entryType]) => entryType === (1 as FileType.File))
+    .map(([name, _]) => name);
+
+  // Find ignore files and get ignore arrays from their contexts
+  // These are done separately so that .continueignore can override .gitignore
+  const gitIgnoreFile = dirFiles.find((name) => name === ".gitignore");
+  const continueIgnoreFile = dirFiles.find(
+    (name) => name === ".continueignore",
+  );
+
+  const getGitIgnorePatterns = async () => {
+    if (gitIgnoreFile) {
+      const contents = await ide.readFile(`${currentDir}/.gitignore`);
+      return gitIgArrayFromFile(contents);
+    }
+    return [];
+  };
+  const getContinueIgnorePatterns = async () => {
+    if (continueIgnoreFile) {
+      const contents = await ide.readFile(`${currentDir}/.continueignore`);
+      return gitIgArrayFromFile(contents);
+    }
+    return [];
+  };
+
+  const ignoreArrays = await Promise.all([
+    getGitIgnorePatterns(),
+    getContinueIgnorePatterns(),
+  ]);
+
+  // Note precedence here!
+  const ignoreContext = ignore()
+    .add(ignoreArrays[0]) // gitignore
+    .add(defaultAndGlobalIgnores) // default file/folder ignores followed by global .continueignore - this is combined for speed
+    .add(ignoreArrays[1]); // local .continueignore
+
+  return ignoreContext;
 }

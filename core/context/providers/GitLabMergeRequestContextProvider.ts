@@ -1,4 +1,5 @@
 import { AxiosError, AxiosInstance } from "axios";
+
 import {
   ContextItem,
   ContextProviderDescription,
@@ -64,9 +65,7 @@ const getSubprocess = async (extras: ContextProviderExtras) => {
   const workingDir = await extras.ide.getWorkspaceDirs().then(trimFirstElement);
 
   return (command: string) =>
-    extras.ide
-      .subprocess(`cd ${workingDir}; ${command}`)
-      .then(trimFirstElement);
+    extras.ide.subprocess(command, workingDir).then(trimFirstElement);
 };
 
 class GitLabMergeRequestContextProvider extends BaseContextProvider {
@@ -95,7 +94,7 @@ class GitLabMergeRequestContextProvider extends BaseContextProvider {
     });
   }
 
-  private async getRemoteBranchName(
+  private async getRemoteBranchInfo(
     extras: ContextProviderExtras,
   ): Promise<RemoteBranchInfo> {
     const subprocess = await getSubprocess(extras);
@@ -122,9 +121,16 @@ class GitLabMergeRequestContextProvider extends BaseContextProvider {
 
     const remoteUrl = await subprocess(`git remote get-url ${branchRemote}`);
 
-    const urlMatches = /:(?<project>.*).git/.exec(remoteUrl);
+    let urlMatches: RegExpExecArray | null;
+    if (/https?.*/.test(remoteUrl)) {
+      const pathname = new URL(remoteUrl).pathname;
+      urlMatches = /\/(?<projectPath>.*?)(?:(?=\.git)|$)/.exec(pathname)
+    } else {
+      // ssh
+      urlMatches = /:(?<projectPath>.*).git/.exec(remoteUrl)
+    }
 
-    const project = urlMatches?.groups?.project ?? null;
+    const project = urlMatches?.groups?.projectPath ?? null;
 
     return {
       branch: remoteBranch,
@@ -136,7 +142,7 @@ class GitLabMergeRequestContextProvider extends BaseContextProvider {
     query: string,
     extras: ContextProviderExtras,
   ): Promise<ContextItem[]> {
-    const { branch, project } = await this.getRemoteBranchName(extras);
+    const { branch, project } = await this.getRemoteBranchInfo(extras);
 
     const api = await this.getApi();
 
@@ -269,7 +275,7 @@ class GitLabMergeRequestContextProvider extends BaseContextProvider {
       if (ex instanceof AxiosError) {
         if (ex.response) {
           const errorMessage = ex.response?.data
-            ? ex.response.data.message ?? JSON.stringify(ex.response?.data)
+            ? (ex.response.data.message ?? JSON.stringify(ex.response?.data))
             : `${ex.response.status}: ${ex.response.statusText}`;
           content += `GitLab Error: ${errorMessage}`;
         } else {

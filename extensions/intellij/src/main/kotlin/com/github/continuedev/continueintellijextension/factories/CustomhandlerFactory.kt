@@ -51,7 +51,7 @@ class CustomResourceHandler : CefResourceHandler, DumbAware {
         responseLength: IntRef,
         redirectUrl: StringRef
     ) {
-        if (currentUrl !== null){
+        if (currentUrl !== null) {
             when {
                 currentUrl!!.contains("css") -> cefResponse.mimeType = "text/css"
                 currentUrl!!.contains("js") -> cefResponse.mimeType = "text/javascript"
@@ -99,7 +99,7 @@ sealed class ResourceHandlerState {
 
 class OpenedConnection(private val connection: URLConnection?) :
     ResourceHandlerState() {
-        
+
     private val inputStream: InputStream? by lazy {
         connection?.inputStream
     }
@@ -111,7 +111,10 @@ class OpenedConnection(private val connection: URLConnection?) :
     ) {
         try {
             if (connection != null) {
-                val url = connection.url.toString()
+                val fullUrl = connection.url.toString()
+                // Extract only the resource path after the JAR prefix to prevent incorrect mime type matching
+                // (e.g., if a user's home folder contains "js" in the path)
+                val url = fullUrl.substringAfterLast("jar!/", fullUrl)
                 when {
                     url.contains("css") -> cefResponse.mimeType = "text/css"
                     url.contains("js") -> cefResponse.mimeType = "text/javascript"
@@ -140,7 +143,7 @@ class OpenedConnection(private val connection: URLConnection?) :
         bytesRead: IntRef,
         callback: CefCallback
     ): Boolean {
-        return inputStream?.let {inputStream ->
+        return inputStream?.let { inputStream ->
             val availableSize = inputStream.available()
             return if (availableSize > 0) {
                 val maxBytesToRead = minOf(availableSize, bytesToRead)

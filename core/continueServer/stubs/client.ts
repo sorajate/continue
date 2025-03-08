@@ -15,7 +15,7 @@ export class ContinueServerClient implements IContinueServerClient {
       this.url =
         typeof serverUrl !== "string" || serverUrl === ""
           ? undefined
-          : new URL(serverUrl);
+          : new URL(serverUrl.endsWith("/") ? serverUrl : `${serverUrl}/`);
     } catch (e) {
       console.warn("Invalid Continue server url", e);
       this.url = undefined;
@@ -30,7 +30,7 @@ export class ContinueServerClient implements IContinueServerClient {
     return this.url !== undefined && this.userToken !== undefined;
   }
 
-  public async getConfig(): Promise<{ configJson: string; configJs: string }> {
+  public async getConfig(): Promise<{ configJson: string }> {
     const userToken = await this.userToken;
     const response = await fetch(new URL("sync", this.url).href, {
       method: "GET",

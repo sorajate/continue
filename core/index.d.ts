@@ -1,5 +1,6 @@
+import { DataDestination, ModelRole } from "@continuedev/config-yaml";
+import Parser from "web-tree-sitter";
 import { GetGhTokenArgs } from "./protocol/ide";
-
 declare global {
   interface Window {
     ide?: "vscode";
@@ -41,19 +42,41 @@ export interface IndexingProgressUpdate {
   progress: number;
   desc: string;
   shouldClearIndexes?: boolean;
-  status: "loading" | "indexing" | "done" | "failed" | "paused" | "disabled";
+  status:
+    | "loading"
+    | "indexing"
+    | "done"
+    | "failed"
+    | "paused"
+    | "disabled"
+    | "cancelled";
   debugInfo?: string;
 }
 
-export type PromptTemplate =
-  | string
-  | ((
-      history: ChatMessage[],
-      otherData: Record<string, string>,
-    ) => string | ChatMessage[]);
+// This is more or less a V2 of IndexingProgressUpdate for docs etc.
+export interface IndexingStatus {
+  id: string;
+  type: "docs";
+  progress: number;
+  description: string;
+  status: "indexing" | "complete" | "paused" | "failed" | "aborted" | "pending";
+  embeddingsProviderId?: string;
+  isReindexing?: boolean;
+  debugInfo?: string;
+  title: string;
+  icon?: string;
+  url?: string;
+}
+
+export type PromptTemplateFunction = (
+  history: ChatMessage[],
+  otherData: Record<string, string>,
+) => string | ChatMessage[];
+
+export type PromptTemplate = string | PromptTemplateFunction;
 
 export interface ILLM extends LLMOptions {
-  get providerName(): ModelProvider;
+  get providerName(): string;
 
   uniqueId: string;
   model: string;
@@ -70,35 +93,55 @@ export interface ILLM extends LLMOptions {
   llmRequestHook?: (model: string, prompt: string) => any;
   apiKey?: string;
   apiBase?: string;
+  cacheBehavior?: CacheBehavior;
+  capabilities?: ModelCapability;
+  roles?: ModelRole[];
 
-  engine?: string;
+  deployment?: string;
   apiVersion?: string;
   apiType?: string;
   region?: string;
   projectId?: string;
 
-  complete(prompt: string, options?: LLMFullCompletionOptions): Promise<string>;
+  // Embedding options
+  embeddingId: string;
+  maxEmbeddingChunkSize: number;
+  maxEmbeddingBatchSize: number;
+
+  complete(
+    prompt: string,
+    signal: AbortSignal,
+    options?: LLMFullCompletionOptions,
+  ): Promise<string>;
 
   streamComplete(
     prompt: string,
+    signal: AbortSignal,
     options?: LLMFullCompletionOptions,
   ): AsyncGenerator<string, PromptLog>;
 
   streamFim(
     prefix: string,
     suffix: string,
+    signal: AbortSignal,
     options?: LLMFullCompletionOptions,
   ): AsyncGenerator<string, PromptLog>;
 
   streamChat(
     messages: ChatMessage[],
+    signal: AbortSignal,
     options?: LLMFullCompletionOptions,
   ): AsyncGenerator<ChatMessage, PromptLog>;
 
   chat(
     messages: ChatMessage[],
+    signal: AbortSignal,
     options?: LLMFullCompletionOptions,
   ): Promise<ChatMessage>;
+
+  embed(chunks: string[]): Promise<number[][]>;
+
+  rerank(query: string, chunks: Chunk[]): Promise<number[]>;
 
   countTokens(text: string): number;
 
@@ -136,8 +179,8 @@ export type FetchFunction = (url: string | URL, init?: any) => Promise<any>;
 export interface ContextProviderExtras {
   config: ContinueConfig;
   fullInput: string;
-  embeddingsProvider: EmbeddingsProvider;
-  reranker: Reranker | undefined;
+  embeddingsProvider: ILLM | null;
+  reranker: ILLM | null;
   llm: ILLM;
   ide: IDE;
   selectedCode: RangeInFile[];
@@ -156,10 +199,12 @@ export interface CustomContextProvider {
   description?: string;
   renderInlineAs?: string;
   type?: ContextProviderType;
+
   getContextItems(
     query: string,
     extras: ContextProviderExtras,
   ): Promise<ContextItem[]>;
+
   loadSubmenuItems?: (
     args: LoadSubmenuItemsArgs,
   ) => Promise<ContextSubmenuItem[]>;
@@ -173,19 +218,25 @@ export interface ContextSubmenuItem {
   metadata?: any;
 }
 
-export interface SiteIndexingConfig {
-  title: string;
-  startUrl: string;
-  rootUrl?: string;
-  maxDepth?: number;
-  faviconUrl?: string;
+export interface ContextSubmenuItemWithProvider extends ContextSubmenuItem {
+  providerTitle: string;
 }
 
 export interface SiteIndexingConfig {
-  startUrl: string;
-  rootUrl?: string;
   title: string;
+  startUrl: string;
   maxDepth?: number;
+  faviconUrl?: string;
+  useLocalCrawling?: boolean;
+  rootUrl?: string; // Currently only used by preindexed docs
+}
+
+export interface DocsIndexingDetails {
+  startUrl: string;
+  config: SiteIndexingConfig;
+  indexingStatus: IndexingStatus | undefined;
+  chunks: Chunk[];
+  isPreIndexedDoc: boolean;
 }
 
 export interface IContextProvider {
@@ -199,14 +250,18 @@ export interface IContextProvider {
   loadSubmenuItems(args: LoadSubmenuItemsArgs): Promise<ContextSubmenuItem[]>;
 }
 
-export interface PersistedSessionInfo {
-  history: ChatHistory;
-  title: string;
-  workspaceDirectory: string;
-  sessionId: string;
+export interface Checkpoint {
+  [filepath: string]: string;
 }
 
-export interface SessionInfo {
+export interface Session {
+  sessionId: string;
+  title: string;
+  workspaceDirectory: string;
+  history: ChatHistoryItem[];
+}
+
+export interface SessionMetadata {
   sessionId: string;
   title: string;
   dateCreated: string;
@@ -232,10 +287,12 @@ export interface Range {
   start: Position;
   end: Position;
 }
+
 export interface Position {
   line: number;
   character: number;
 }
+
 export interface FileEdit {
   filepath: string;
   range: Range;
@@ -251,24 +308,78 @@ export interface CompletionOptions extends BaseCompletionOptions {
   model: string;
 }
 
-export type ChatMessageRole = "user" | "assistant" | "system";
+export type ChatMessageRole = "user" | "assistant" | "system" | "tool";
 
-export interface MessagePart {
-  type: "text" | "imageUrl";
-  text?: string;
-  imageUrl?: { url: string };
-}
+export type TextMessagePart = {
+  type: "text";
+  text: string;
+};
+
+export type ImageMessagePart = {
+  type: "imageUrl";
+  imageUrl: { url: string };
+};
+
+export type MessagePart = TextMessagePart | ImageMessagePart;
 
 export type MessageContent = string | MessagePart[];
 
-export interface ChatMessage {
-  role: ChatMessageRole;
+export interface ToolCall {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+export interface ToolCallDelta {
+  id?: string;
+  type?: "function";
+  function?: {
+    name?: string;
+    arguments?: string;
+  };
+}
+
+export interface ToolResultChatMessage {
+  role: "tool";
+  content: string;
+  toolCallId: string;
+}
+
+export interface UserChatMessage {
+  role: "user";
   content: MessageContent;
 }
+
+export interface AssistantChatMessage {
+  role: "assistant";
+  content: MessageContent;
+  toolCalls?: ToolCallDelta[];
+}
+
+export interface SystemChatMessage {
+  role: "system";
+  content: string;
+}
+
+export type ChatMessage =
+  | UserChatMessage
+  | AssistantChatMessage
+  | SystemChatMessage
+  | ToolResultChatMessage;
 
 export interface ContextItemId {
   providerTitle: string;
   itemId: string;
+}
+
+export type ContextItemUriTypes = "file" | "url";
+
+export interface ContextItemUri {
+  type: ContextItemUriTypes;
+  value: string;
 }
 
 export interface ContextItem {
@@ -278,22 +389,26 @@ export interface ContextItem {
   editing?: boolean;
   editable?: boolean;
   icon?: string;
+  uri?: ContextItemUri;
+  hidden?: boolean;
 }
 
-export interface ContextItemWithId {
-  content: string;
-  name: string;
-  description: string;
+export interface ContextItemWithId extends ContextItem {
   id: ContextItemId;
-  editing?: boolean;
-  editable?: boolean;
-  icon?: string;
 }
 
 export interface InputModifiers {
   useCodebase: boolean;
   noContext: boolean;
 }
+
+export interface SymbolWithRange extends RangeInFile {
+  name: string;
+  type: Parser.SyntaxNode["type"];
+  content: string;
+}
+
+export type FileSymbolMap = Record<string, SymbolWithRange[]>;
 
 export interface PromptLog {
   modelTitle: string;
@@ -302,21 +417,46 @@ export interface PromptLog {
   completion: string;
 }
 
-export interface ChatHistoryItem {
-  message: ChatMessage;
-  editorState?: any;
-  modifiers?: InputModifiers;
-  contextItems: ContextItemWithId[];
-  promptLogs?: PromptLog[];
+export type MessageModes = "chat" | "edit";
+
+export type ToolStatus =
+  | "generating"
+  | "generated"
+  | "calling"
+  | "done"
+  | "canceled";
+
+// Will exist only on "assistant" messages with tool calls
+interface ToolCallState {
+  toolCallId: string;
+  toolCall: ToolCall;
+  status: ToolStatus;
+  parsedArgs: any;
+  output?: ContextItem[];
 }
 
-export type ChatHistory = ChatHistoryItem[];
+interface Reasoning {
+  active: boolean;
+  text: string;
+  startAt: number;
+  endAt?: number;
+}
 
-// LLM
+export interface ChatHistoryItem {
+  message: ChatMessage;
+  contextItems: ContextItemWithId[];
+  editorState?: any;
+  modifiers?: InputModifiers;
+  promptLogs?: PromptLog[];
+  toolCallState?: ToolCallState;
+  isGatheringContext?: boolean;
+  checkpoint?: Checkpoint;
+  isBeforeCheckpoint?: boolean;
+  reasoning?: Reasoning;
+}
 
 export interface LLMFullCompletionOptions extends BaseCompletionOptions {
   log?: boolean;
-
   model?: string;
 }
 
@@ -338,16 +478,31 @@ export interface LLMOptions {
   writeLog?: (str: string) => Promise<void>;
   llmRequestHook?: (model: string, prompt: string) => any;
   apiKey?: string;
-  aiGatewaySlug?: string;
+
+  // continueProperties
+  apiKeyLocation?: string;
   apiBase?: string;
+  orgScopeId?: string | null;
+
+  onPremProxyUrl?: string | null;
+
+  aiGatewaySlug?: string;
+  cacheBehavior?: CacheBehavior;
+  capabilities?: ModelCapability;
+  roles?: ModelRole[];
 
   useLegacyCompletionsEndpoint?: boolean;
+
+  // Embedding options
+  embeddingId?: string;
+  maxEmbeddingChunkSize?: number;
+  maxEmbeddingBatchSize?: number;
 
   // Cloudflare options
   accountId?: string;
 
   // Azure options
-  engine?: string;
+  deployment?: string;
   apiVersion?: string;
   apiType?: string;
 
@@ -355,23 +510,18 @@ export interface LLMOptions {
   profile?: string;
   modelArn?: string;
 
-  // AWS and GCP Options
+  // AWS and VertexAI Options
   region?: string;
 
-  // GCP Options
+  // VertexAI and Watsonx Options
   projectId?: string;
-  capabilities?: ModelCapability;
 
-  // IBM watsonx options
-  watsonxUrl?: string;
-  watsonxCreds?: string;
-  watsonxProjectId?: string;
-  watsonxStopToken?: string;
-  watsonxApiVersion?: string;
-  watsonxFullUrl?: string;
+  // IBM watsonx Options
+  deploymentId?: string;
 
-  cacheSystemMessage?: boolean;
+  env?: Record<string, string | number | boolean>;
 }
+
 type RequireAtLeastOne<T, Keys extends keyof T = keyof T> = Pick<
   T,
   Exclude<keyof T, Keys>
@@ -384,14 +534,16 @@ export interface CustomLLMWithOptionals {
   options: LLMOptions;
   streamCompletion?: (
     prompt: string,
+    signal: AbortSignal,
     options: CompletionOptions,
     fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
   ) => AsyncGenerator<string>;
   streamChat?: (
     messages: ChatMessage[],
+    signal: AbortSignal,
     options: CompletionOptions,
     fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
-  ) => AsyncGenerator<string>;
+  ) => AsyncGenerator<ChatMessage | string>;
   listModels?: (
     fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
   ) => Promise<string[]>;
@@ -414,18 +566,19 @@ export interface DiffLine {
   line: string;
 }
 
-export class Problem {
+export interface Problem {
   filepath: string;
   range: Range;
   message: string;
 }
 
-export class Thread {
+export interface Thread {
   name: string;
   id: number;
 }
 
 export type IdeType = "vscode" | "jetbrains";
+
 export interface IdeInfo {
   ideType: IdeType;
   name: string;
@@ -455,70 +608,121 @@ export interface IdeSettings {
   remoteConfigSyncPeriod: number;
   userToken: string;
   enableControlServerBeta: boolean;
+  continueTestEnvironment: "none" | "production" | "staging" | "local";
   pauseCodebaseIndexOnStart: boolean;
-  enableDebugLogs: boolean;
 }
+
+export interface FileStats {
+  size: number;
+  lastModified: number;
+}
+
+/** Map of file name to stats */
+export type FileStatsMap = {
+  [path: string]: FileStats;
+};
 
 export interface IDE {
   getIdeInfo(): Promise<IdeInfo>;
+
   getIdeSettings(): Promise<IdeSettings>;
-  getDiff(): Promise<string>;
+
+  getDiff(includeUnstaged: boolean): Promise<string[]>;
+
+  getClipboardContent(): Promise<{ text: string; copiedAt: string }>;
+
   isTelemetryEnabled(): Promise<boolean>;
+
   getUniqueId(): Promise<string>;
+
   getTerminalContents(): Promise<string>;
+
   getDebugLocals(threadIndex: number): Promise<string>;
+
   getTopLevelCallStackSources(
     threadIndex: number,
     stackDepth: number,
   ): Promise<string[]>;
+
   getAvailableThreads(): Promise<Thread[]>;
-  listFolders(): Promise<string[]>;
+
   getWorkspaceDirs(): Promise<string[]>;
+
   getWorkspaceConfigs(): Promise<ContinueRcJson[]>;
-  fileExists(filepath: string): Promise<boolean>;
+
+  fileExists(fileUri: string): Promise<boolean>;
+
   writeFile(path: string, contents: string): Promise<void>;
+
   showVirtualFile(title: string, contents: string): Promise<void>;
-  getContinueDir(): Promise<string>;
+
   openFile(path: string): Promise<void>;
-  runCommand(command: string): Promise<void>;
-  saveFile(filepath: string): Promise<void>;
-  readFile(filepath: string): Promise<string>;
-  readRangeInFile(filepath: string, range: Range): Promise<string>;
-  showLines(
-    filepath: string,
-    startLine: number,
-    endLine: number,
-  ): Promise<void>;
-  showDiff(
-    filepath: string,
-    newContents: string,
-    stepIndex: number,
-  ): Promise<void>;
+
+  openUrl(url: string): Promise<void>;
+
+  runCommand(command: string, options?: TerminalOptions): Promise<void>;
+
+  saveFile(fileUri: string): Promise<void>;
+
+  readFile(fileUri: string): Promise<string>;
+
+  readRangeInFile(fileUri: string, range: Range): Promise<string>;
+
+  showLines(fileUri: string, startLine: number, endLine: number): Promise<void>;
+
   getOpenFiles(): Promise<string[]>;
-  getCurrentFile(): Promise<string | undefined>;
+
+  getCurrentFile(): Promise<
+    | undefined
+    | {
+        isUntitled: boolean;
+        path: string;
+        contents: string;
+      }
+  >;
+
+  getLastFileSaveTimestamp?(): number;
+
+  updateLastFileSaveTimestamp?(): void;
+
   getPinnedFiles(): Promise<string[]>;
+
   getSearchResults(query: string): Promise<string>;
-  subprocess(command: string): Promise<[string, string]>;
-  getProblems(filepath?: string | undefined): Promise<Problem[]>;
+
+  subprocess(command: string, cwd?: string): Promise<[string, string]>;
+
+  getProblems(fileUri?: string | undefined): Promise<Problem[]>;
+
   getBranch(dir: string): Promise<string>;
+
   getTags(artifactId: string): Promise<IndexTag[]>;
+
   getRepoName(dir: string): Promise<string | undefined>;
+
   showToast(
     type: ToastType,
     message: string,
     ...otherParams: any[]
   ): Promise<any>;
+
   getGitRootPath(dir: string): Promise<string | undefined>;
+
   listDir(dir: string): Promise<[string, FileType][]>;
-  getLastModified(files: string[]): Promise<{ [path: string]: number }>;
+
+  getFileStats(files: string[]): Promise<FileStatsMap>;
+
   getGitHubAuthToken(args: GetGhTokenArgs): Promise<string | undefined>;
+
+  // Secret Storage
+  readSecrets(keys: string[]): Promise<Record<string, string>>;
+
+  writeSecrets(secrets: { [key: string]: string }): Promise<void>;
 
   // LSP
   gotoDefinition(location: Location): Promise<RangeInFile[]>;
 
   // Callbacks
-  onDidChangeActiveTextEditor(callback: (filepath: string) => void): void;
-  pathSep(): Promise<string>;
+  onDidChangeActiveTextEditor(callback: (fileUri: string) => void): void;
 }
 
 // Slash Commands
@@ -534,6 +738,7 @@ export interface ContinueSDK {
   selectedCode: RangeInFile[];
   config: ContinueConfig;
   fetch: FetchFunction;
+  completionOptions?: LLMFullCompletionOptions;
 }
 
 export interface SlashCommand {
@@ -545,7 +750,7 @@ export interface SlashCommand {
 
 // Config
 
-type StepName =
+export type StepName =
   | "AnswerQuestionChroma"
   | "GenerateShellCommandStep"
   | "EditHighlightedCodeStep"
@@ -557,11 +762,10 @@ type StepName =
   | "GenerateShellCommandStep"
   | "DraftIssueStep";
 
-type ContextProviderName =
+export type ContextProviderName =
   | "diff"
-  | "github"
   | "terminal"
-  | "locals"
+  | "debugger"
   | "open"
   | "google"
   | "search"
@@ -578,6 +782,7 @@ type ContextProviderName =
   | "gitlab-mr"
   | "os"
   | "currentFile"
+  | "greptile"
   | "outline"
   | "continue-proxy"
   | "highlights"
@@ -585,9 +790,13 @@ type ContextProviderName =
   | "issue"
   | "repo-map"
   | "url"
+  | "commit"
+  | "web"
+  | "discord"
+  | "clipboard"
   | string;
 
-type TemplateType =
+export type TemplateType =
   | "llama2"
   | "alpaca"
   | "zephyr"
@@ -603,116 +812,8 @@ type TemplateType =
   | "codellama-70b"
   | "llava"
   | "gemma"
+  | "granite"
   | "llama3";
-
-type ModelProvider =
-  | "openai"
-  | "free-trial"
-  | "anthropic"
-  | "cohere"
-  | "together"
-  | "ollama"
-  | "huggingface-tgi"
-  | "huggingface-inference-api"
-  | "kindo"
-  | "llama.cpp"
-  | "replicate"
-  | "text-gen-webui"
-  | "lmstudio"
-  | "llamafile"
-  | "gemini"
-  | "mistral"
-  | "bedrock"
-  | "bedrockimport"
-  | "sagemaker"
-  | "deepinfra"
-  | "flowise"
-  | "groq"
-  | "continue-proxy"
-  | "fireworks"
-  | "custom"
-  | "cloudflare"
-  | "deepseek"
-  | "azure"
-  | "openai-aiohttp"
-  | "msty"
-  | "watsonx"
-  | "openrouter"
-  | "sambanova"
-  | "nvidia"
-  | "vllm"
-  | "mock";
-
-export type ModelName =
-  | "AUTODETECT"
-  // OpenAI
-  | "gpt-3.5-turbo"
-  | "gpt-3.5-turbo-16k"
-  | "gpt-4"
-  | "gpt-3.5-turbo-0613"
-  | "gpt-4-32k"
-  | "gpt-4o"
-  | "gpt-4o-mini"
-  | "gpt-4-turbo"
-  | "gpt-4-turbo-preview"
-  | "gpt-4-vision-preview"
-  // Mistral
-  | "codestral-latest"
-  | "open-mistral-7b"
-  | "open-mixtral-8x7b"
-  | "open-mixtral-8x22b"
-  | "mistral-small-latest"
-  | "mistral-large-latest"
-  | "mistral-7b"
-  | "mistral-8x7b"
-  | "mistral-tiny"
-  | "mistral-small"
-  | "mistral-medium"
-  | "mistral-embed"
-  // Llama 2
-  | "llama2-7b"
-  | "llama2-13b"
-  | "llama2-70b"
-  | "codellama-7b"
-  | "codellama-13b"
-  | "codellama-34b"
-  | "codellama-70b"
-  // Llama 3
-  | "llama3-8b"
-  | "llama3-70b"
-  // Other Open-source
-  | "phi2"
-  | "phind-codellama-34b"
-  | "wizardcoder-7b"
-  | "wizardcoder-13b"
-  | "wizardcoder-34b"
-  | "zephyr-7b"
-  | "codeup-13b"
-  | "deepseek-7b"
-  | "deepseek-33b"
-  | "neural-chat-7b"
-  // Anthropic
-  | "claude-3-5-sonnet-20240620"
-  | "claude-3-opus-20240229"
-  | "claude-3-sonnet-20240229"
-  | "claude-3-haiku-20240307"
-  | "claude-2.1"
-  | "claude-2"
-  // Cohere
-  | "command-r"
-  | "command-r-plus"
-  // Gemini
-  | "gemini-pro"
-  | "gemini-1.5-pro-latest"
-  | "gemini-1.5-pro"
-  | "gemini-1.5-flash-latest"
-  | "gemini-1.5-flash"
-  // Tab autocomplete
-  | "deepseek-1b"
-  | "starcoder-1b"
-  | "starcoder-3b"
-  | "starcoder2-3b"
-  | "stable-code-3b";
 
 export interface RequestOptions {
   timeout?: number;
@@ -723,6 +824,11 @@ export interface RequestOptions {
   extraBodyProperties?: { [key: string]: any };
   noProxy?: string[];
   clientCertificate?: ClientCertificateOptions;
+}
+
+export interface CacheBehavior {
+  cacheSystemMessage?: boolean;
+  cacheConversation?: boolean;
 }
 
 export interface ClientCertificateOptions {
@@ -750,10 +856,50 @@ export interface SlashCommandDescription {
 export interface CustomCommand {
   name: string;
   prompt: string;
-  description: string;
+  description?: string;
 }
 
-interface BaseCompletionOptions {
+export interface Prediction {
+  type: "content";
+  content:
+    | string
+    | {
+        type: "text";
+        text: string;
+      }[];
+}
+
+export interface ToolExtras {
+  ide: IDE;
+  llm: ILLM;
+  fetch: FetchFunction;
+  tool: Tool;
+}
+
+export interface Tool {
+  type: "function";
+  function: {
+    name: string;
+    description?: string;
+    parameters?: Record<string, any>;
+    strict?: boolean | null;
+  };
+
+  displayTitle: string;
+  wouldLikeTo: string;
+  readonly: boolean;
+  uri?: string;
+  faviconUrl?: string;
+}
+
+interface ToolChoice {
+  type: "function";
+  function: {
+    name: string;
+  };
+}
+
+export interface BaseCompletionOptions {
   temperature?: number;
   topP?: number;
   topK?: number;
@@ -764,21 +910,33 @@ interface BaseCompletionOptions {
   stop?: string[];
   maxTokens?: number;
   numThreads?: number;
+  useMmap?: boolean;
   keepAlive?: number;
   raw?: boolean;
   stream?: boolean;
+  prediction?: Prediction;
+  tools?: Tool[];
+  toolChoice?: ToolChoice;
 }
 
 export interface ModelCapability {
   uploadImage?: boolean;
+  tools?: boolean;
 }
 
 export interface ModelDescription {
   title: string;
-  provider: ModelProvider;
+  provider: string;
   model: string;
   apiKey?: string;
+
+  // continueProperties
+  apiKeyLocation?: string;
   apiBase?: string;
+  orgScopeId?: string | null;
+
+  onPremProxyUrl?: string | null;
+
   contextLength?: number;
   maxStopWords?: number;
   template?: TemplateType;
@@ -786,91 +944,87 @@ export interface ModelDescription {
   systemMessage?: string;
   requestOptions?: RequestOptions;
   promptTemplates?: { [key: string]: string };
+  cacheBehavior?: CacheBehavior;
   capabilities?: ModelCapability;
+  roles?: ModelRole[];
 }
-
-export type EmbeddingsProviderName =
-  | "bedrock"
-  | "huggingface-tei"
-  | "transformers.js"
-  | "ollama"
-  | "openai"
-  | "cohere"
-  | "free-trial"
-  | "gemini"
-  | "continue-proxy"
-  | "deepinfra"
-  | "nvidia"
-  | "voyage"
-  | "mistral";
 
 export interface EmbedOptions {
   apiBase?: string;
   apiKey?: string;
   model?: string;
-  engine?: string;
+  deployment?: string;
   apiType?: string;
   apiVersion?: string;
   requestOptions?: RequestOptions;
-  maxChunkSize?: number;
-  maxBatchSize?: number;
+  maxEmbeddingChunkSize?: number;
+  maxEmbeddingBatchSize?: number;
+
   // AWS options
   profile?: string;
 
-  // AWS and GCP Options
+  // AWS and VertexAI Options
   region?: string;
+
+  // VertexAI and Watsonx Options
+  projectId?: string;
 }
 
 export interface EmbeddingsProviderDescription extends EmbedOptions {
-  provider: EmbeddingsProviderName;
+  provider: string;
 }
-
-export interface EmbeddingsProvider {
-  id: string;
-  providerName: EmbeddingsProviderName;
-  maxChunkSize: number;
-  embed(chunks: string[]): Promise<number[][]>;
-}
-
-export type RerankerName =
-  | "cohere"
-  | "voyage"
-  | "llm"
-  | "free-trial"
-  | "huggingface-tei"
-  | "continue-proxy";
 
 export interface RerankerDescription {
-  name: RerankerName;
-  params?: { [key: string]: any };
-}
-
-export interface Reranker {
   name: string;
-  rerank(query: string, chunks: Chunk[]): Promise<number[]>;
+  params?: { [key: string]: any };
 }
 
 export interface TabAutocompleteOptions {
   disable: boolean;
-  useCopyBuffer: boolean;
-  useFileSuffix: boolean;
   maxPromptTokens: number;
   debounceDelay: number;
   maxSuffixPercentage: number;
   prefixPercentage: number;
+  transform?: boolean;
   template?: string;
   multilineCompletions: "always" | "never" | "auto";
   slidingWindowPrefixPercentage: number;
   slidingWindowSize: number;
-  maxSnippetPercentage: number;
-  recentlyEditedSimilarityThreshold: number;
   useCache: boolean;
   onlyMyCode: boolean;
-  useOtherFiles: boolean;
   useRecentlyEdited: boolean;
-  recentLinePrefixMatchMinLength: number;
   disableInFiles?: string[];
   useImports?: boolean;
+  showWhateverWeHaveAtXMs?: number;
+  // true = enabled, false = disabled, number = enabled with priority
+  experimental_includeClipboard: boolean | number;
+  experimental_includeRecentlyVisitedRanges: boolean | number;
+  experimental_includeRecentlyEditedRanges: boolean | number;
+  experimental_includeDiff: boolean | number;
+}
+
+export interface StdioOptions {
+  type: "stdio";
+  command: string;
+  args: string[];
+  env?: Record<string, string>;
+}
+
+export interface WebSocketOptions {
+  type: "websocket";
+  url: string;
+}
+
+export interface SSEOptions {
+  type: "sse";
+  url: string;
+}
+
+export type TransportOptions = StdioOptions | WebSocketOptions | SSEOptions;
+
+export interface MCPOptions {
+  transport: TransportOptions;
+  faviconUrl?: string;
 }
 
 export interface ContinueUIConfig {
@@ -878,9 +1032,11 @@ export interface ContinueUIConfig {
   fontSize?: number;
   displayRawMarkdown?: boolean;
   showChatScrollbar?: boolean;
+  codeWrap?: boolean;
+  showSessionTabs?: boolean;
 }
 
-interface ContextMenuConfig {
+export interface ContextMenuConfig {
   comment?: string;
   docstring?: string;
   fix?: string;
@@ -888,17 +1044,48 @@ interface ContextMenuConfig {
   fixGrammar?: string;
 }
 
-interface ModelRoles {
+export interface ExperimentalModelRoles {
+  repoMapFileSelection?: string;
   inlineEdit?: string;
   applyCodeBlock?: string;
-  repoMapFileSelection?: string;
 }
+
+export type EditStatus =
+  | "not-started"
+  | "streaming"
+  | "accepting"
+  | "accepting:full-diff"
+  | "done";
+
+export type ApplyStateStatus =
+  | "streaming" // Changes are being applied to the file
+  | "done" // All changes have been applied, awaiting user to accept/reject
+  | "closed"; // All changes have been applied. Note that for new files, we immediately set the status to "closed"
+
+export interface ApplyState {
+  streamId: string;
+  status?: ApplyStateStatus;
+  numDiffs?: number;
+  filepath?: string;
+  fileContent?: string;
+}
+
+export interface RangeInFileWithContents {
+  filepath: string;
+  range: {
+    start: { line: number; character: number };
+    end: { line: number; character: number };
+  };
+  contents: string;
+}
+
+export type CodeToEdit = RangeInFileWithContents | FileWithContents;
 
 /**
  * Represents the configuration for a quick action in the Code Lens.
  * Quick actions are custom commands that can be added to function and class declarations.
  */
-interface QuickActionConfig {
+export interface QuickActionConfig {
   /**
    * The title of the quick action that will display in the Code Lens.
    */
@@ -923,9 +1110,9 @@ export type DefaultContextProvider = ContextProviderWithParams & {
   query?: string;
 };
 
-interface ExperimentalConfig {
+export interface ExperimentalConfig {
   contextMenuPrompts?: ContextMenuConfig;
-  modelRoles?: ModelRoles;
+  modelRoles?: ExperimentalModelRoles;
   defaultContext?: DefaultContextProvider[];
   promptPath?: string;
 
@@ -946,10 +1133,11 @@ interface ExperimentalConfig {
    * This is needed to crawl a large number of documentation sites that are dynamically rendered.
    */
   useChromiumForDocsCrawling?: boolean;
+  modelContextProtocolServers?: MCPOptions[];
 }
 
-interface AnalyticsConfig {
-  type: string;
+export interface AnalyticsConfig {
+  provider: string;
   url?: string;
   clientKey?: string;
 }
@@ -976,6 +1164,7 @@ export interface SerializedContinueConfig {
   experimental?: ExperimentalConfig;
   analytics?: AnalyticsConfig;
   docs?: SiteIndexingConfig[];
+  data?: DataDestination[];
 }
 
 export type ConfigMergeType = "merge" | "overwrite";
@@ -1012,7 +1201,7 @@ export interface Config {
   /** An optional token to identify a user. Not used by Continue unless you write custom coniguration that requires such a token */
   userToken?: string;
   /** The provider used to calculate embeddings. If left empty, Continue will use transformers.js to calculate the embeddings with all-MiniLM-L6-v2 */
-  embeddingsProvider?: EmbeddingsProviderDescription | EmbeddingsProvider;
+  embeddingsProvider?: EmbeddingsProviderDescription | ILLM;
   /** The model that Continue will use for tab autocompletions. */
   tabAutocompleteModel?:
     | CustomLLM
@@ -1023,11 +1212,12 @@ export interface Config {
   /** UI styles customization */
   ui?: ContinueUIConfig;
   /** Options for the reranker */
-  reranker?: RerankerDescription | Reranker;
+  reranker?: RerankerDescription | ILLM;
   /** Experimental configuration */
   experimental?: ExperimentalConfig;
   /** Analytics configuration */
   analytics?: AnalyticsConfig;
+  data?: DataDestination[];
 }
 
 // in the actual Continue source code
@@ -1042,14 +1232,15 @@ export interface ContinueConfig {
   disableSessionTitles?: boolean;
   disableIndexing?: boolean;
   userToken?: string;
-  embeddingsProvider: EmbeddingsProvider;
-  tabAutocompleteModels?: ILLM[];
   tabAutocompleteOptions?: Partial<TabAutocompleteOptions>;
   ui?: ContinueUIConfig;
-  reranker?: Reranker;
   experimental?: ExperimentalConfig;
   analytics?: AnalyticsConfig;
   docs?: SiteIndexingConfig[];
+  tools: Tool[];
+  modelsByRole: Record<ModelRole, ILLM[]>;
+  selectedModelByRole: Record<ModelRole, ILLM | null>;
+  data?: DataDestination[];
 }
 
 export interface BrowserSerializedContinueConfig {
@@ -1063,9 +1254,55 @@ export interface BrowserSerializedContinueConfig {
   disableIndexing?: boolean;
   disableSessionTitles?: boolean;
   userToken?: string;
-  embeddingsProvider?: string;
   ui?: ContinueUIConfig;
-  reranker?: RerankerDescription;
   experimental?: ExperimentalConfig;
   analytics?: AnalyticsConfig;
+  docs?: SiteIndexingConfig[];
+  tools: Tool[];
+  usePlatform: boolean;
+  tabAutocompleteOptions?: Partial<TabAutocompleteOptions>;
+  modelsByRole: Record<ModelRole, ModelDescription[]>;
+  selectedModelByRole: Record<ModelRole, ModelDescription | null>;
+}
+
+// DOCS SUGGESTIONS AND PACKAGE INFO
+export interface FilePathAndName {
+  path: string;
+  name: string;
+}
+
+export interface PackageFilePathAndName extends FilePathAndName {
+  packageRegistry: string; // e.g. npm, pypi
+}
+
+export type ParsedPackageInfo = {
+  name: string;
+  packageFile: PackageFilePathAndName;
+  language: string;
+  version: string;
+};
+
+export type PackageDetails = {
+  docsLink?: string;
+  docsLinkWarning?: string;
+  title?: string;
+  description?: string;
+  repo?: string;
+  license?: string;
+};
+
+export type PackageDetailsSuccess = PackageDetails & {
+  docsLink: string;
+};
+
+export type PackageDocsResult = {
+  packageInfo: ParsedPackageInfo;
+} & (
+  | { error: string; details?: never }
+  | { details: PackageDetailsSuccess; error?: never }
+);
+
+export interface TerminalOptions {
+  reuseTerminal?: boolean;
+  terminalName?: string;
 }

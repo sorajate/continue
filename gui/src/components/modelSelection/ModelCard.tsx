@@ -9,9 +9,10 @@ import {
 } from "..";
 import { PackageDimension } from "../../pages/AddNewModel/configs/models";
 import { providers } from "../../pages/AddNewModel/configs/providers";
-import HeaderButtonWithText from "../HeaderButtonWithText";
+import HeaderButtonWithToolTip from "../gui/HeaderButtonWithToolTip";
 import InfoHover from "../InfoHover";
-import ModelProviderTag, { ModelProviderTags } from "./ModelProviderTag";
+import { ModelProviderTag } from "./ModelProviderTag";
+import { ModelProviderTags } from "./utils";
 
 interface ModelCardProps {
   title: string;
@@ -119,8 +120,7 @@ function ModelCard(props: ModelCardProps) {
                 if ((e.target as any).closest("a")) {
                   return;
                 }
-
-                props.onClick(e, dimensionChoices, selectedProvider);
+                props.onClick?.(e, dimensionChoices, selectedProvider);
               }
         }
       >
@@ -161,9 +161,9 @@ function ModelCard(props: ModelCardProps) {
             href={props.refUrl}
             target="_blank"
           >
-            <HeaderButtonWithText text="Read the docs">
+            <HeaderButtonWithToolTip text="Read the docs">
               <BookOpenIcon width="1.6em" height="1.6em" />
-            </HeaderButtonWithText>
+            </HeaderButtonWithToolTip>
           </a>
         )}
       </div>
@@ -175,8 +175,11 @@ function ModelCard(props: ModelCardProps) {
               <>
                 <div className="flex items-center justify-between">
                   <div className="flex items-center">
-                    <InfoHover msg={dimension.description} />
-                    <p className="mx-2 text-sm my-0 py-0">{dimension.name}</p>
+                    <InfoHover
+                      id={dimension.name}
+                      msg={dimension.description}
+                    />
+                    <p className="mx-2 my-0 py-0 text-sm">{dimension.name}</p>
                   </div>
                   <div className="flex items-center">
                     {Object.keys(dimension.options).map((key) => {
@@ -201,24 +204,25 @@ function ModelCard(props: ModelCardProps) {
             );
           })}
           {props.providerOptions?.length && (
-            <div className="flex items-center flex-wrap justify-end rtl">
+            <div className="rtl flex flex-wrap items-center justify-end">
               <div className="flex items-center">
                 <InfoHover
+                  id={"provider-info"}
                   msg={
                     "Select the provider through which you will access the model"
                   }
                 />
               </div>
-              <div className="flex items-center flex-wrap justify-end rtl">
+              <div className="rtl flex flex-wrap items-center justify-end">
                 {props.providerOptions?.map((option, i) => {
                   const info = providers[option];
                   if (!info) {
                     return null;
                   }
                   return (
-                    <HeaderButtonWithText
+                    <HeaderButtonWithToolTip
                       text={info.title}
-                      className="p-2 text-center mx-1 items-center"
+                      className="mx-1 items-center p-2 text-center"
                       style={{
                         backgroundColor:
                           (i === 0 &&
@@ -237,7 +241,7 @@ function ModelCard(props: ModelCardProps) {
                           height="24px"
                         />
                       )}
-                    </HeaderButtonWithText>
+                    </HeaderButtonWithToolTip>
                   );
                 })}
               </div>

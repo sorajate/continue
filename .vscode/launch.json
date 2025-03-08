@@ -20,7 +20,10 @@
       "outFiles": ["${workspaceFolder}/extensions/vscode/out/extension.js"],
       "preLaunchTask": "vscode-extension:build",
       "env": {
-        // "CONTROL_PLANE_ENV": "local"
+        // "CONTROL_PLANE_ENV": "local",
+        "CONTINUE_GLOBAL_DIR": "${workspaceFolder}/extensions/.continue-debug"
+        // "staging" for the preview deployment	        "CONTINUE_GLOBAL_DIR": "${workspaceFolder}/extensions/.continue-debug"
+        // "local" for entirely local development of control plane/proxy
       }
     },
     {
@@ -29,15 +32,15 @@
       "name": "Core Binary",
       "skipFiles": ["<node_internals>/**"],
       "program": "${workspaceFolder}/binary/out/index.js",
-      // "preLaunchTask": "binary:esbuild",
       "outFiles": ["${workspaceFolder}/binary/out/**/*.js"],
       "sourceMaps": true,
       "smartStep": true,
       "internalConsoleOptions": "openOnSessionStart",
       "cwd": "${workspaceFolder}/binary",
       "env": {
+        // "CONTROL_PLANE_ENV": "test",
         "CONTINUE_DEVELOPMENT": "true",
-        "CONTINUE_GLOBAL_DIR": "${workspaceFolder}/binary/.continue"
+        "CONTINUE_GLOBAL_DIR": "${workspaceFolder}/extensions/.continue-debug"
       }
     },
     {
@@ -135,25 +138,25 @@
       "env": {
         "NODE_OPTIONS": "--experimental-vm-modules"
       }
+    },
+    {
+      "name": "[config-yaml] Jest Test Debugger, Current Open File",
+      "type": "node",
+      "request": "launch",
+      "runtimeArgs": [
+        "--inspect-brk",
+        "${workspaceRoot}/packages/config-yaml/node_modules/jest/bin/jest.js",
+        "--runInBand",
+        "--config",
+        "${workspaceRoot}/packages/config-yaml/jest.config.mjs",
+        "${relativeFile}"
+      ],
+      "cwd": "${workspaceRoot}/packages/config-yaml",
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen",
+      "env": {
+        "NODE_OPTIONS": "--experimental-vm-modules"
+      }
     }
-    // {
-    //   "name": "[openai-adapters] Jest Test Debugger, Current Open File",
-    //   "type": "node",
-    //   "request": "launch",
-    //   "runtimeArgs": [
-    //     "--inspect-brk",
-    //     "${workspaceRoot}/packages/openai-adapters/node_modules/jest/bin/jest.js",
-    //     "--runInBand",
-    //     "--config",
-    //     "${workspaceRoot}/packages/openai-adapters/jest.config.mjs",
-    //     "${relativeFile}"
-    //   ],
-    //   "cwd": "${workspaceRoot}/packages/openai-adapters",
-    //   "console": "integratedTerminal",
-    //   "internalConsoleOptions": "neverOpen",
-    //   "env": {
-    //     "NODE_OPTIONS": "--experimental-vm-modules"
-    //   }
-    // }
   ]
 }

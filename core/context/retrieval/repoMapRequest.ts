@@ -1,29 +1,54 @@
 import { Chunk, ContinueConfig, IDE, ILLM } from "../..";
-import { stripImages } from "../../llm/images";
-import generateRepoMap from "../../util/repoMap";
+import { getModelByRole } from "../../config/util";
+import generateRepoMap from "../../util/generateRepoMap";
+import { renderChatMessage } from "../../util/messageContent";
+
+const SUPPORTED_MODEL_TITLE_FAMILIES = [
+  "claude-3",
+  "llama3.1",
+  "llama3.2",
+  "gemini-1.5",
+  "gpt-4",
+];
+
+function isSupportedModel(
+  config: ContinueConfig,
+  modelTitle?: string,
+): boolean {
+  if (config.experimental?.modelRoles?.repoMapFileSelection) {
+    return true;
+  }
+
+  if (!modelTitle) {
+    return false;
+  }
+
+  const lowercaseModelTitle = modelTitle.toLowerCase();
+
+  return SUPPORTED_MODEL_TITLE_FAMILIES.some((title) =>
+    lowercaseModelTitle.includes(title),
+  );
+}
 
 export async function requestFilesFromRepoMap(
   defaultLlm: ILLM,
   config: ContinueConfig,
   ide: IDE,
   input: string,
-  filterDirectory?: string,
+  filterDirUri?: string,
 ): Promise<Chunk[]> {
-  const llm =
-    config.models.find(
-      (model) =>
-        model.title === config.experimental?.modelRoles?.repoMapFileSelection,
-    ) ?? defaultLlm;
+  const llm = getModelByRole(config, "repoMapFileSelection") ?? defaultLlm;
 
   // Only supported for Claude models right now
-  if (!llm.model.toLowerCase().includes("claude")) {
+  if (!isSupportedModel(config, llm.title)) {
     return [];
   }
 
   try {
     const repoMap = await generateRepoMap(llm, ide, {
-      signatures: false,
-      dirs: filterDirectory ? [filterDirectory] : undefined,
+      dirUris: filterDirUri ? [filterDirUri] : undefined,
+      includeSignatures: false,
+      outputRelativeUriPaths: false,
     });
 
     const prompt = `${repoMap}
@@ -34,36 +59,34 @@ After this, your response should begin with a <results> tag, followed by a list 
 
 This is the question that you should select relevant files for: "${input}"`;
 
-    const response = await llm.chat([
-      { role: "user", content: prompt },
-      { role: "assistant", content: "<reasoning>" },
-    ]);
-    const content = stripImages(response.content);
-    console.debug("Repo map retrieval response: ", content);
+    const response = await llm.chat(
+      [
+        { role: "user", content: prompt },
+        { role: "assistant", content: "<reasoning>" },
+      ],
+      new AbortController().signal,
+    );
+    const content = renderChatMessage(response);
 
     if (!content.includes("\n")) {
       return [];
     }
 
-    const pathSep = await ide.pathSep();
-    const subDirPrefix = filterDirectory ? filterDirectory + pathSep : "";
-    const files =
-      content
-        .split("<results>")[1]
-        ?.split("</results>")[0]
-        ?.split("\n")
-        .filter(Boolean)
-        .map((file) => file.trim())
-        .map((file) => subDirPrefix + file) ?? [];
+    const fileUris = content
+      .split("<results>")[1]
+      ?.split("</results>")[0]
+      ?.split("\n")
+      .filter(Boolean)
+      .map((uri) => uri.trim());
 
     const chunks = await Promise.all(
-      files.map(async (file) => {
-        const content = await ide.readFile(file);
+      fileUris.map(async (uri) => {
+        const content = await ide.readFile(uri);
         const lineCount = content.split("\n").length;
         const chunk: Chunk = {
-          digest: file,
+          digest: uri,
           content,
-          filepath: file,
+          filepath: uri,
           endLine: lineCount - 1,
           startLine: 0,
           index: 0,

@@ -1,6 +1,5 @@
 import { streamSse } from "@continuedev/fetch";
-import fetch from "node-fetch";
-import { OpenAI } from "openai/index.mjs";
+import { OpenAI } from "openai/index";
 import {
   ChatCompletion,
   ChatCompletionChunk,
@@ -9,9 +8,10 @@ import {
   Completion,
   CompletionCreateParamsNonStreaming,
   CompletionCreateParamsStreaming,
-} from "openai/resources/index.mjs";
+} from "openai/resources/index";
 import { ChatCompletionCreateParams } from "openai/src/resources/index.js";
-import { LlmApiConfig } from "../index.js";
+import { AnthropicConfig } from "../types.js";
+import { chatChunk, chatChunkFromDelta, customFetch } from "../util.js";
 import {
   BaseLlmApi,
   CreateRerankResponse,
@@ -22,7 +22,7 @@ import {
 export class AnthropicApi implements BaseLlmApi {
   apiBase: string = "https://api.anthropic.com/v1/";
 
-  constructor(protected config: LlmApiConfig) {
+  constructor(protected config: AnthropicConfig) {
     this.apiBase = config.apiBase ?? this.apiBase;
     if (!this.apiBase.endsWith("/")) {
       this.apiBase += "/";
@@ -36,6 +36,7 @@ export class AnthropicApi implements BaseLlmApi {
     } else if (typeof oaiBody.stop === "string" && oaiBody.stop.trim() !== "") {
       stop = [oaiBody.stop];
     }
+
     const anthropicBody = {
       messages: this._convertMessages(
         oaiBody.messages.filter((msg) => msg.role !== "system"),
@@ -47,6 +48,20 @@ export class AnthropicApi implements BaseLlmApi {
       model: oaiBody.model,
       stop_sequences: stop,
       stream: oaiBody.stream,
+      tools: oaiBody.tools?.map((tool) => ({
+        name: tool.function.name,
+        description: tool.function.description,
+        input_schema: tool.function.parameters,
+      })),
+      tool_choice: oaiBody.tool_choice
+        ? {
+            type: "tool",
+            name:
+              typeof oaiBody.tool_choice === "string"
+                ? oaiBody.tool_choice
+                : oaiBody.tool_choice?.function.name,
+          }
+        : undefined,
     };
 
     return anthropicBody;
@@ -61,19 +76,25 @@ export class AnthropicApi implements BaseLlmApi {
       }
       return {
         ...message,
-        content: message.content.map((part) => {
-          if (part.type === "text") {
-            return part;
-          }
-          return {
-            type: "image",
-            source: {
-              type: "base64",
-              media_type: "image/jpeg",
-              data: part.image_url.url.split(",")[1],
-            },
-          };
-        }),
+        content: message.content
+          .map((part) => {
+            if (part.type === "text") {
+              if ((part.text?.trim() ?? "") === "") {
+                return null;
+              }
+              return part;
+            }
+            return {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "image/jpeg",
+                // @ts-ignore
+                data: part.image_url.url.split(",")[1],
+              },
+            };
+          })
+          .filter((x) => x !== null),
       };
     });
     return messages;
@@ -81,17 +102,22 @@ export class AnthropicApi implements BaseLlmApi {
 
   async chatCompletionNonStream(
     body: ChatCompletionCreateParamsNonStreaming,
+    signal: AbortSignal,
   ): Promise<ChatCompletion> {
-    const response = await fetch(new URL("messages", this.apiBase), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "anthropic-version": "2023-06-01",
-        "x-api-key": this.config.apiKey,
+    const response = await customFetch(this.config.requestOptions)(
+      new URL("messages", this.apiBase),
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "anthropic-version": "2023-06-01",
+          "x-api-key": this.config.apiKey,
+        },
+        body: JSON.stringify(this._convertBody(body)),
+        signal,
       },
-      body: JSON.stringify(this._convertBody(body)),
-    });
+    );
 
     const completion = (await response.json()) as any;
     return {
@@ -112,6 +138,7 @@ export class AnthropicApi implements BaseLlmApi {
           message: {
             role: "assistant",
             content: completion.content[0].text,
+            refusal: null,
           },
           index: 0,
         },
@@ -120,54 +147,91 @@ export class AnthropicApi implements BaseLlmApi {
   }
   async *chatCompletionStream(
     body: ChatCompletionCreateParamsStreaming,
+    signal: AbortSignal,
   ): AsyncGenerator<ChatCompletionChunk, any, unknown> {
     body.messages;
-    const response = await fetch(new URL("messages", this.apiBase), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "anthropic-version": "2023-06-01",
-        "x-api-key": this.config.apiKey,
+    const response = await customFetch(this.config.requestOptions)(
+      new URL("messages", this.apiBase),
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "anthropic-version": "2023-06-01",
+          "x-api-key": this.config.apiKey,
+        },
+        body: JSON.stringify(this._convertBody(body)),
+        signal,
       },
-      body: JSON.stringify(this._convertBody(body)),
-    });
+    );
 
+    let lastToolUseId: string | undefined;
+    let lastToolUseName: string | undefined;
     for await (const value of streamSse(response as any)) {
-      if (value.delta?.text) {
-        yield {
-          id: value.id,
-          object: "chat.completion.chunk",
-          model: body.model,
-          created: Date.now(),
-          choices: [
-            {
-              index: 0,
-              logprobs: undefined,
-              finish_reason: null,
-              delta: {
-                role: "assistant",
+      // https://docs.anthropic.com/en/api/messages-streaming#event-types
+      switch (value.type) {
+        case "content_block_start":
+          if (value.content_block.type === "tool_use") {
+            lastToolUseId = value.content_block.id;
+            lastToolUseName = value.content_block.name;
+          }
+          break;
+        case "content_block_delta":
+          // https://docs.anthropic.com/en/api/messages-streaming#delta-types
+          switch (value.delta.type) {
+            case "text_delta":
+              yield chatChunk({
                 content: value.delta.text,
-              },
-            },
-          ],
-          usage: undefined,
-        };
+                model: body.model,
+              });
+              break;
+            case "input_json_delta":
+              if (!lastToolUseId || !lastToolUseName) {
+                throw new Error("No tool use found");
+              }
+              yield chatChunkFromDelta({
+                model: body.model,
+                delta: {
+                  tool_calls: [
+                    {
+                      id: lastToolUseId,
+                      type: "function",
+                      index: 0,
+                      function: {
+                        name: lastToolUseName,
+                        arguments: value.delta.partial_json,
+                      },
+                    },
+                  ],
+                },
+              });
+              break;
+          }
+          break;
+        case "content_block_stop":
+          lastToolUseId = undefined;
+          lastToolUseName = undefined;
+          break;
+        default:
+          break;
       }
     }
   }
   async completionNonStream(
     body: CompletionCreateParamsNonStreaming,
+    signal: AbortSignal,
   ): Promise<Completion> {
     throw new Error("Method not implemented.");
   }
   async *completionStream(
     body: CompletionCreateParamsStreaming,
+    signal: AbortSignal,
   ): AsyncGenerator<Completion, any, unknown> {
     throw new Error("Method not implemented.");
   }
   async *fimStream(
     body: FimCreateParamsStreaming,
+    signal: AbortSignal,
   ): AsyncGenerator<ChatCompletionChunk, any, unknown> {
     throw new Error("Method not implemented.");
   }
@@ -179,6 +243,10 @@ export class AnthropicApi implements BaseLlmApi {
   }
 
   async rerank(body: RerankCreateParams): Promise<CreateRerankResponse> {
+    throw new Error("Method not implemented.");
+  }
+
+  list(): Promise<OpenAI.Models.Model[]> {
     throw new Error("Method not implemented.");
   }
 }

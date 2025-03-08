@@ -1,26 +1,69 @@
-import { ChatMessage, CompletionOptions, ModelProvider } from "../../index.js";
+import { ChatMessage, CompletionOptions, LLMOptions } from "../../index.js";
 import { BaseLLM } from "../index.js";
 
-class Mock extends BaseLLM {
-  static Completion = "Test Completion";
-  static providerName: ModelProvider = "mock";
+type MockMessage = ChatMessage | "REPEAT_LAST_MSG" | "REPEAT_SYSTEM_MSG";
+
+class MockLLM extends BaseLLM {
+  public completion: string = "Test Completion";
+  public chatStreams: MockMessage[][] | undefined;
+  static providerName = "mock";
+
+  constructor(options: LLMOptions) {
+    super(options);
+    this.templateMessages = undefined;
+    this.chatStreams = options.requestOptions?.extraBodyProperties?.chatStream;
+  }
 
   protected async *_streamComplete(
     prompt: string,
+    signal: AbortSignal,
     options: CompletionOptions,
   ): AsyncGenerator<string> {
-    yield Mock.Completion;
+    yield this.completion;
   }
 
   protected async *_streamChat(
     messages: ChatMessage[],
+    signal: AbortSignal,
     options: CompletionOptions,
   ): AsyncGenerator<ChatMessage> {
-    yield {
-      role: "assistant",
-      content: Mock.Completion,
-    };
+    if (this.chatStreams) {
+      const chatStream =
+        this.chatStreams?.[
+          messages.filter((m) => m.role === "user" || m.role === "tool")
+            .length - 1
+        ];
+      if (chatStream) {
+        for (const message of chatStream) {
+          switch (message) {
+            case "REPEAT_LAST_MSG":
+              yield {
+                role: "assistant",
+                content: messages[messages.length - 1].content,
+              };
+              break;
+            case "REPEAT_SYSTEM_MSG":
+              yield {
+                role: "assistant",
+                content:
+                  messages.find((m) => m.role === "system")?.content || "",
+              };
+              break;
+            default:
+              yield message;
+          }
+        }
+      }
+      return;
+    }
+
+    for (const char of this.completion) {
+      yield {
+        role: "assistant",
+        content: char,
+      };
+    }
   }
 }
 
-export default Mock;
+export default MockLLM;

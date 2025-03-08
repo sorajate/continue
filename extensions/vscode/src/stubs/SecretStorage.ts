@@ -1,6 +1,7 @@
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
+
 import * as vscode from "vscode";
 
 const ENCRYPTION_KEY_NAME = "dev.continue.continue";
@@ -92,13 +93,15 @@ export class SecretStorage {
   }
 
   async store(key: string, value: string): Promise<void> {
-    const encryptedValue = await this.encrypt(value, this.keyToFilepath(key));
+    const filePath = this.keyToFilepath(key);
+    await this.encrypt(value, filePath);
   }
 
   async get(key: string): Promise<string | undefined> {
     const filePath = this.keyToFilepath(key);
     if (fs.existsSync(filePath)) {
-      return await this.decrypt(filePath);
+      const value = await this.decrypt(filePath);
+      return value;
     }
     return undefined;
   }

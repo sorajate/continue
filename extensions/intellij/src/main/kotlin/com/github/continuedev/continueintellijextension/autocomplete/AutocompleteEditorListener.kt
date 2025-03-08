@@ -3,14 +3,19 @@ package com.github.continuedev.continueintellijextension.autocomplete
 import com.intellij.openapi.application.invokeLater
 import com.intellij.openapi.components.service
 import com.intellij.openapi.editor.Editor
+import com.intellij.openapi.editor.EditorKind
 import com.intellij.openapi.editor.event.*
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.FileEditorManagerEvent
 import com.intellij.openapi.fileEditor.FileEditorManagerListener
 import com.intellij.openapi.util.TextRange
 
-class AutocompleteCaretListener: CaretListener {
+class AutocompleteCaretListener : CaretListener {
     override fun caretPositionChanged(event: CaretEvent) {
+        if(event.editor.editorKind != EditorKind.MAIN_EDITOR) {
+            return
+        }
+
         val caret = event.caret ?: return
         val offset = caret.offset
         val editor = caret.editor
@@ -29,7 +34,8 @@ class AutocompleteCaretListener: CaretListener {
     }
 }
 
-class AutocompleteDocumentListener(private val editorManager: FileEditorManager, private val editor: Editor): DocumentListener {
+class AutocompleteDocumentListener(private val editorManager: FileEditorManager, private val editor: Editor) :
+    DocumentListener {
     override fun documentChanged(event: DocumentEvent) {
         if (editor != editorManager.selectedTextEditor) {
             return
@@ -42,13 +48,14 @@ class AutocompleteDocumentListener(private val editorManager: FileEditorManager,
 
         // Invoke later is important, otherwise the completion will be triggered before the document is updated
         // causing the old caret offset to be used
+        // TODO: concurrency
         invokeLater {
             service.triggerCompletion(editor)
         }
     }
 }
 
-class AutocompleteEditorListener: EditorFactoryListener {
+class AutocompleteEditorListener : EditorFactoryListener {
     private val disposables = mutableMapOf<Editor, () -> Unit>()
     override fun editorCreated(event: EditorFactoryEvent) {
         val editor = event.editor

@@ -1,5 +1,4 @@
 import { JSONContent } from "@tiptap/react";
-import { IndexingProgressUpdate } from "core";
 import { OnboardingStatus } from "../components/OnboardingCard";
 
 type LocalStorageTypes = {
@@ -9,13 +8,13 @@ type LocalStorageTypes = {
   ide: "vscode" | "jetbrains";
   ftc: number;
   fontSize: number;
-  lastSessionId: string | undefined;
-  inputHistory: JSONContent[];
+  [key: `inputHistory_${string}`]: JSONContent[];
   extensionVersion: string;
-  indexingState: IndexingProgressUpdate;
   showTutorialCard: boolean;
   shownProfilesIntroduction: boolean;
   disableIndexing: boolean;
+  /** Indicates whether the user has seen any kind of onboarding card since hub.continue.dev */
+  seenHubIntro: boolean;
 };
 
 export function getLocalStorage<T extends keyof LocalStorageTypes>(

@@ -1,17 +1,25 @@
-import { Chunk } from "../../../index.js";
-import { RETRIEVAL_PARAMS } from "../../../util/parameters.js";
-import { requestFilesFromRepoMap } from "../repoMapRequest.js";
-import { deduplicateChunks } from "../util.js";
-import BaseRetrievalPipeline from "./BaseRetrievalPipeline.js";
+import { Chunk } from "../../..";
+import { RETRIEVAL_PARAMS } from "../../../util/parameters";
+import { findUriInDirs } from "../../../util/uri";
+import { requestFilesFromRepoMap } from "../repoMapRequest";
+import { deduplicateChunks } from "../util";
+
+import BaseRetrievalPipeline, {
+  RetrievalPipelineRunArguments,
+} from "./BaseRetrievalPipeline";
 
 export default class RerankerRetrievalPipeline extends BaseRetrievalPipeline {
-  private async _retrieveInitial(): Promise<Chunk[]> {
-    const { input, nRetrieve, filterDirectory } = this.options;
+  private async _retrieveInitial(
+    args: RetrievalPipelineRunArguments,
+  ): Promise<Chunk[]> {
+    const { input, nRetrieve, filterDirectory, config } = this.options;
 
     let retrievalResults: Chunk[] = [];
 
-    const ftsChunks = await this.retrieveFts(input, nRetrieve);
-    const embeddingsChunks = await this.retrieveEmbeddings(input, nRetrieve);
+    const ftsChunks = await this.retrieveFts(args, nRetrieve);
+    const embeddingsChunks = !!config.selectedModelByRole.embed
+      ? await this.retrieveEmbeddings(input, nRetrieve)
+      : [];
     const recentlyEditedFilesChunks =
       await this.retrieveAndChunkRecentlyEditedFiles(nRetrieve);
 
@@ -32,8 +40,8 @@ export default class RerankerRetrievalPipeline extends BaseRetrievalPipeline {
 
     if (filterDirectory) {
       // Backup if the individual retrieval methods don't listen
-      retrievalResults = retrievalResults.filter((chunk) =>
-        chunk.filepath.startsWith(filterDirectory),
+      retrievalResults = retrievalResults.filter(
+        (chunk) => !!findUriInDirs(chunk.filepath, [filterDirectory]).foundInDir,
       );
     }
 
@@ -44,14 +52,18 @@ export default class RerankerRetrievalPipeline extends BaseRetrievalPipeline {
   }
 
   private async _rerank(input: string, chunks: Chunk[]): Promise<Chunk[]> {
-    if (!this.options.config.reranker) {
-      throw new Error("No reranker provided");
+    if (!this.options.config.selectedModelByRole.rerank) {
+      throw new Error("No reranker set up");
     }
 
-    let scores: number[] = await this.options.config.reranker.rerank(
-      input,
-      chunks,
-    );
+    // remove empty chunks -- some APIs fail on that
+    chunks = chunks.filter((chunk) => chunk.content);
+
+    let scores: number[] =
+      await this.options.config.selectedModelByRole.rerank.rerank(
+        input,
+        chunks,
+      );
 
     // Filter out low-scoring results
     let results = chunks;
@@ -62,8 +74,11 @@ export default class RerankerRetrievalPipeline extends BaseRetrievalPipeline {
     //   (score) => score >= RETRIEVAL_PARAMS.rerankThreshold,
     // );
 
+    const chunkIndexMap = new Map<Chunk, number>();
+    chunks.forEach((chunk, idx) => chunkIndexMap.set(chunk, idx));
+
     results.sort(
-      (a, b) => scores[results.indexOf(a)] - scores[results.indexOf(b)],
+      (a, b) => scores[chunkIndexMap.get(a)!] - scores[chunkIndexMap.get(b)!],
     );
     results = results.slice(-this.options.nFinal);
     return results;
@@ -95,9 +110,9 @@ export default class RerankerRetrievalPipeline extends BaseRetrievalPipeline {
     return results;
   }
 
-  async run(): Promise<Chunk[]> {
-    const intialResults = await this._retrieveInitial();
-    const rankedResults = await this._rerank(this.options.input, intialResults);
+  async run(args: RetrievalPipelineRunArguments): Promise<Chunk[]> {
+    let results = await this._retrieveInitial(args);
+    results = await this._rerank(args.query, results);
 
     // // // Expand top reranked results
     // const expanded = await this._expandRankedResults(results);
@@ -111,7 +126,7 @@ export default class RerankerRetrievalPipeline extends BaseRetrievalPipeline {
 
     // TODO: stitch together results
 
-    return rankedResults;
+    return results;
   }
 }
 

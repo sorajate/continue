@@ -1,27 +1,34 @@
-import { ContextProviderName } from "../../";
 import { BaseContextProvider } from "../";
+import { ContextProviderName } from "../../";
+
+import ClipboardContextProvider from "./ClipboardContextProvider";
 import CodeContextProvider from "./CodeContextProvider";
 import ContinueProxyContextProvider from "./ContinueProxyContextProvider";
 import CurrentFileContextProvider from "./CurrentFileContextProvider";
 import DatabaseContextProvider from "./DatabaseContextProvider";
+import DebugLocalsProvider from "./DebugLocalsProvider";
 import DiffContextProvider from "./DiffContextProvider";
+import DiscordContextProvider from "./DiscordContextProvider";
 import DocsContextProvider from "./DocsContextProvider";
 import FileTreeContextProvider from "./FileTreeContextProvider";
 import FolderContextProvider from "./FolderContextProvider";
+import GitCommitContextProvider from "./GitCommitContextProvider";
 import GitHubIssuesContextProvider from "./GitHubIssuesContextProvider";
 import GitLabMergeRequestContextProvider from "./GitLabMergeRequestContextProvider";
 import GoogleContextProvider from "./GoogleContextProvider";
+import GreptileContextProvider from "./GreptileContextProvider";
 import HttpContextProvider from "./HttpContextProvider";
 import JiraIssuesContextProvider from "./JiraIssuesContextProvider/";
-import LocalsProvider from "./LocalsProvider";
-import OSContextProvider from "./OSContextProvider";
+import MCPContextProvider from "./MCPContextProvider";
 import OpenFilesContextProvider from "./OpenFilesContextProvider";
+import OSContextProvider from "./OSContextProvider";
 import PostgresContextProvider from "./PostgresContextProvider";
 import ProblemsContextProvider from "./ProblemsContextProvider";
+import RepoMapContextProvider from "./RepoMapContextProvider";
 import SearchContextProvider from "./SearchContextProvider";
 import TerminalContextProvider from "./TerminalContextProvider";
 import URLContextProvider from "./URLContextProvider";
-import RepoMapContextProvider from "./RepoMapContextProvider";
+import WebContextProvider from "./WebContextProvider";
 
 /**
  * Note: We are currently omitting the following providers due to bugs:
@@ -30,13 +37,13 @@ import RepoMapContextProvider from "./RepoMapContextProvider";
  *
  * See this issue for details: https://github.com/continuedev/continue/issues/1365
  */
-const Providers: (typeof BaseContextProvider)[] = [
+export const Providers: (typeof BaseContextProvider)[] = [
   DiffContextProvider,
   FileTreeContextProvider,
   GitHubIssuesContextProvider,
   GoogleContextProvider,
   TerminalContextProvider,
-  LocalsProvider,
+  DebugLocalsProvider,
   OpenFilesContextProvider,
   HttpContextProvider,
   SearchContextProvider,
@@ -53,6 +60,12 @@ const Providers: (typeof BaseContextProvider)[] = [
   URLContextProvider,
   ContinueProxyContextProvider,
   RepoMapContextProvider,
+  DiscordContextProvider,
+  GreptileContextProvider,
+  WebContextProvider,
+  MCPContextProvider,
+  GitCommitContextProvider,
+  ClipboardContextProvider,
 ];
 
 export function contextProviderClassFromName(

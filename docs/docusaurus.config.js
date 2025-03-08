@@ -7,6 +7,12 @@ const darkCodeTheme = themes.dracula;
 
 /** @type {import('@docusaurus/types').Config} */
 const config = {
+  // Docusaurus V3.6 experimental faster compile features
+  // https://docusaurus.io/blog/releases/3.6#adoption-strategy
+  future: {
+    experimental_faster: true,
+  },
+
   title: "Continue",
   tagline:
     "the open-source library for accelerating software development with language models",
@@ -31,10 +37,13 @@ const config = {
   // to replace "en" with "zh-Hans".
   i18n: {
     defaultLocale: "en",
-    locales: ["en"],
+    locales: [
+      "en",
+      // "zh-CN"
+    ],
   },
 
-  themes: [["docusaurus-json-schema-plugin", {}]],
+  themes: [],
 
   presets: [
     [
@@ -81,7 +90,7 @@ const config = {
             type: "docSidebar",
             sidebarId: "docsSidebar",
             position: "left",
-            label: "Docs",
+            label: "User Guide",
             href: "/",
           },
           {
@@ -90,6 +99,20 @@ const config = {
             position: "left",
             label: "Customize",
             href: "/customize/overview",
+          },
+          {
+            type: "docSidebar",
+            sidebarId: "customizingSidebar",
+            position: "left",
+            label: "Reference",
+            href: "/reference",
+          },
+          {
+            type: "docSidebar",
+            sidebarId: "hubSidebar",
+            position: "left",
+            label: "Hub",
+            href: "/hub/introduction",
           },
           {
             to: "https://github.com/continuedev/continue",
@@ -102,6 +125,10 @@ const config = {
             label: "Discord",
             position: "right",
             className: "discord-navbar",
+          },
+          {
+            type: "localeDropdown",
+            position: "right",
           },
         ],
       },
@@ -174,6 +201,30 @@ const config = {
       {
         redirects: [
           {
+            to: "/hub/introduction",
+            from: "/hub",
+          },
+          {
+            to: "/hub/governance/org-permissions",
+            from: "/hub/governance",
+          },
+          {
+            to: "/hub/secrets/secret-types",
+            from: "/hub/secrets",
+          },
+          {
+            to: "/hub/assistants/intro",
+            from: "/hub/assistants",
+          },
+          {
+            to: "/hub/blocks/intro",
+            from: "/hub/blocks",
+          },
+          {
+            to: "/customize/overview",
+            from: "/customize",
+          },
+          {
             to: "/customize/overview",
             from: "/customization",
           },
@@ -186,8 +237,24 @@ const config = {
           //   from: "/getting-started",
           // },
           {
-            to: "/customize/model-types",
-            from: "/setup/overview",
+            to: "/customize/model-roles",
+            from: ["/customize/model-types", "/setup/overview"],
+          },
+          {
+            to: "/customize/model-roles/embeddings",
+            from: "/customize/model-types/embeddings",
+          },
+          {
+            to: "/customize/model-roles/autocomplete",
+            from: "/customize/model-types/autocomplete",
+          },
+          {
+            to: "/customize/model-roles/chat",
+            from: "/customize/model-types/chat",
+          },
+          {
+            to: "/customize/model-roles/reranking",
+            from: "/customize/model-types/reranking",
           },
           {
             to: "/getting-started/overview",
@@ -230,16 +297,16 @@ const config = {
             from: "/changelog",
           },
           {
-            to: "/customize/config",
+            to: "/reference",
             from: ["/customization/code-config", "/reference/config"],
           },
           {
             to: "/customize/context-providers",
-            from: "/customization/context-providers",
+            from: ["/customization/context-providers"],
           },
           {
-            to: "/customize/development-data",
-            from: "/development-data",
+            to: "/customize/deep-dives/development-data",
+            from: ["/development-data", "/customize/development-data"],
           },
           {
             to: "/customize/deep-dives/docs",
@@ -262,7 +329,7 @@ const config = {
             from: "/reference/Model Providers/deepseek",
           },
           {
-            to: "/customize/model-providers/free-trial",
+            to: "/customize/model-providers",
             from: "/reference/Model Providers/freetrial",
           },
           {
@@ -367,7 +434,11 @@ const config = {
           },
           {
             to: "/customize/model-providers/more/together",
-            from: "/reference/Model Providers/togetherllm",
+            from: "/reference/Model Providers/together",
+          },
+          {
+            to: "/customize/model-providers/more/novita",
+            from: "/reference/Model Providers/novita",
           },
           {
             to: "/customize/model-providers/more/vllm",
@@ -376,6 +447,10 @@ const config = {
           {
             to: "/customize/model-providers/more/watsonx",
             from: "/reference/Model Providers/watsonx",
+          },
+          {
+            to: "/customize/model-providers/more/nebius",
+            from: "/reference/Model Providers/nebius",
           },
           // Sidebar items that should route directly to a subpage
           {

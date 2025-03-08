@@ -1,9 +1,10 @@
 package com.github.continuedev.continueintellijextension.`continue`
 
+import com.github.continuedev.continueintellijextension.constants.MessageTypes
 import com.github.continuedev.continueintellijextension.services.ContinueExtensionSettings
 import com.github.continuedev.continueintellijextension.services.ContinuePluginService
 import com.github.continuedev.continueintellijextension.services.TelemetryService
-import com.github.continuedev.continueintellijextension.toolWindow.MessageTypes
+import com.github.continuedev.continueintellijextension.utils.uuid
 import com.google.gson.Gson
 import com.intellij.openapi.components.service
 import com.intellij.openapi.project.Project
@@ -13,15 +14,20 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Paths
 import java.nio.file.attribute.PosixFilePermission
+import kotlinx.coroutines.*
 
-class CoreMessenger(private val project: Project, esbuildPath: String, continueCorePath: String, ideProtocolClient: IdeProtocolClient) {
+class CoreMessenger(
+    private val project: Project,
+    continueCorePath: String,
+    private val ideProtocolClient: IdeProtocolClient,
+    val coroutineScope: CoroutineScope
+) {
     private var writer: Writer? = null
     private var reader: BufferedReader? = null
     private var process: Process? = null
     private val gson = Gson()
     private val responseListeners = mutableMapOf<String, (Any?) -> Unit>()
-    private val ideProtocolClient = ideProtocolClient
-    private val useTcp: Boolean = false
+    private val useTcp: Boolean = System.getenv("USE_TCP")?.toBoolean() ?: false
 
     private fun write(message: String) {
         try {
@@ -32,20 +38,10 @@ class CoreMessenger(private val project: Project, esbuildPath: String, continueC
         }
     }
 
-    private fun close() {
-        writer?.close()
-        reader?.close()
-        val exitCode = process?.waitFor()
-        println("Subprocess exited with code: $exitCode")
-    }
-
     fun request(messageType: String, data: Any?, messageId: String?, onResponse: (Any?) -> Unit) {
         val id = messageId ?: uuid()
-        val message = gson.toJson(mapOf(
-                "messageId" to id,
-                "messageType" to messageType,
-                "data" to data
-        ))
+        val message =
+            gson.toJson(mapOf("messageId" to id, "messageType" to messageType, "data" to data))
         responseListeners[id] = onResponse
         write(message)
     }
@@ -59,13 +55,12 @@ class CoreMessenger(private val project: Project, esbuildPath: String, continueC
         // IDE listeners
         if (MessageTypes.ideMessageTypes.contains(messageType)) {
             ideProtocolClient.handleMessage(json) { data ->
-                val message = gson.toJson(mapOf(
-                        "messageId" to messageId,
-                        "messageType" to messageType,
-                        "data" to data
-                ))
+                val message =
+                    gson.toJson(
+                        mapOf("messageId" to messageId, "messageType" to messageType, "data" to data)
+                    )
                 write(message)
-            };
+            }
         }
 
         // Forward to webview
@@ -74,12 +69,15 @@ class CoreMessenger(private val project: Project, esbuildPath: String, continueC
             // Can circumvent for getDefaultsModelTitle here for now
             if (messageType == "getDefaultModelTitle") {
                 val continueSettingsService = service<ContinueExtensionSettings>()
-                val defaultModelTitle = continueSettingsService.continueState.lastSelectedInlineEditModel;
-                val message = gson.toJson(mapOf(
-                        "messageId" to messageId,
-                        "messageType" to messageType,
-                        "data" to defaultModelTitle
-                ))
+                val defaultModelTitle = continueSettingsService.continueState.lastSelectedInlineEditModel
+                val message =
+                    gson.toJson(
+                        mapOf(
+                            "messageId" to messageId,
+                            "messageType" to messageType,
+                            "data" to defaultModelTitle
+                        )
+                    )
                 write(message)
             }
             val continuePluginService = project.service<ContinuePluginService>()
@@ -89,27 +87,18 @@ class CoreMessenger(private val project: Project, esbuildPath: String, continueC
         // Responses for messageId
         responseListeners[messageId]?.let { listener ->
             listener(data)
-            if (MessageTypes.generatorTypes.contains(messageType)) {
-                val done = (data as Map<String, Boolean?>)["done"]
-                if (done == true) {
-                    responseListeners.remove(messageId)
-                } else {}
-            } else {
+            val done = (data as Map<String, Boolean>)["done"]
+
+            if (done == true) {
                 responseListeners.remove(messageId)
             }
-
         }
     }
 
     private fun setPermissions(destination: String) {
         val osName = System.getProperty("os.name").toLowerCase()
         if (osName.contains("mac") || osName.contains("darwin")) {
-            ProcessBuilder(
-                    "xattr",
-                    "-dr",
-                    "com.apple.quarantine",
-                    destination
-            ).start()
+            ProcessBuilder("xattr", "-dr", "com.apple.quarantine", destination).start()
             setFilePermissions(destination, "rwxr-xr-x")
         } else if (osName.contains("nix") || osName.contains("nux") || osName.contains("mac")) {
             setFilePermissions(destination, "rwxr-xr-x")
@@ -125,6 +114,7 @@ class CoreMessenger(private val project: Project, esbuildPath: String, continueC
     }
 
     private val exitCallbacks: MutableList<() -> Unit> = mutableListOf()
+
     fun onDidExit(callback: () -> Unit) {
         exitCallbacks.add(callback)
     }
@@ -163,18 +153,20 @@ class CoreMessenger(private val project: Project, esbuildPath: String, continueC
                             e.printStackTrace()
                         }
                     }
-                }.start()
+                }
+                    .start()
             } catch (e: Exception) {
-                println("An error occurred: ${e.message}")
+                println("TCP Connection Error: Unable to connect to 127.0.0.1:3000")
+                println("Reason: ${e.message}")
+                e.printStackTrace()
             }
         } else {
             // Set proper permissions
-            setPermissions(continueCorePath)
-            setPermissions(esbuildPath)
+            coroutineScope.launch(Dispatchers.IO) { setPermissions(continueCorePath) }
 
             // Start the subprocess
-            val processBuilder = ProcessBuilder(continueCorePath)
-                    .directory(File(continueCorePath).parentFile)
+            val processBuilder =
+                ProcessBuilder(continueCorePath).directory(File(continueCorePath).parentFile)
             process = processBuilder.start()
 
             val outputStream = process!!.outputStream
@@ -196,13 +188,10 @@ class CoreMessenger(private val project: Project, esbuildPath: String, continueC
                 }
 
                 println("Core process exited with output: $err")
-                ideProtocolClient.showMessage("Core process exited with output: $err")
 
                 // Log the cause of the failure
                 val telemetryService = service<TelemetryService>()
-                telemetryService.capture("jetbrains_core_exit", mapOf(
-                    "error" to err
-                ))
+                telemetryService.capture("jetbrains_core_exit", mapOf("error" to err))
 
                 // Clean up all resources
                 writer?.close()
@@ -210,7 +199,7 @@ class CoreMessenger(private val project: Project, esbuildPath: String, continueC
                 process?.destroy()
             }
 
-            Thread {
+            coroutineScope.launch(Dispatchers.IO) {
                 try {
                     while (true) {
                         val line = reader?.readLine()
@@ -222,7 +211,7 @@ class CoreMessenger(private val project: Project, esbuildPath: String, continueC
                                 println(e)
                             }
                         } else {
-                            Thread.sleep(100)
+                            delay(100)
                         }
                     }
                 } catch (e: IOException) {
@@ -238,7 +227,14 @@ class CoreMessenger(private val project: Project, esbuildPath: String, continueC
                         e.printStackTrace()
                     }
                 }
-            }.start()
+            }
+        }
+    }
+
+    fun killSubProcess() {
+        process?.isAlive?.let {
+            exitCallbacks.clear()
+            process?.destroy()
         }
     }
 }

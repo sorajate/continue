@@ -1,13 +1,13 @@
-import { getContinueRcPath, getTsConfigPath, migrate } from "core/util/paths";
+import { getContinueRcPath, getTsConfigPath } from "core/util/paths";
 import { Telemetry } from "core/util/posthog";
-import path from "node:path";
 import * as vscode from "vscode";
+
 import { VsCodeExtension } from "../extension/VsCodeExtension";
 import registerQuickFixProvider from "../lang-server/codeActions";
 import { getExtensionVersion } from "../util/util";
-import { getExtensionUri } from "../util/vscode";
+
 import { VsCodeContinueApi } from "./api";
-import { setupInlineTips } from "./inlineTips";
+import setupInlineTips from "./InlineTipManager";
 
 export async function activateExtension(context: vscode.ExtensionContext) {
   // Add necessary files
@@ -19,17 +19,6 @@ export async function activateExtension(context: vscode.ExtensionContext) {
   setupInlineTips(context);
 
   const vscodeExtension = new VsCodeExtension(context);
-
-  migrate("showWelcome_1", () => {
-    vscode.commands.executeCommand(
-      "markdown.showPreview",
-      vscode.Uri.file(
-        path.join(getExtensionUri().fsPath, "media", "welcome.md"),
-      ),
-    );
-
-    vscode.commands.executeCommand("continue.focusContinueInput");
-  });
 
   // Load Continue configuration
   if (!context.globalState.get("hasBeenInstalled")) {

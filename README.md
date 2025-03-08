@@ -8,7 +8,7 @@
 
 <div align="center">
 
-**[Continue](https://docs.continue.dev) is the leading open-source AI code assistant. You can connect any models and any context to build custom autocomplete and chat experiences inside [VS Code](https://marketplace.visualstudio.com/items?itemName=Continue.continue) and [JetBrains](https://plugins.jetbrains.com/plugin/22707-continue-extension)**
+**[Continue](https://docs.continue.dev) enables to developers to create, share, and use custom AI code assistants with our open-source [VS Code](https://marketplace.visualstudio.com/items?itemName=Continue.continue) and [JetBrains](https://plugins.jetbrains.com/plugin/22707-continue-extension) extensions and [hub of models, rules, prompts, docs, and other building blocks](https://hub.continue.dev)**
 
 </div>
 
@@ -46,7 +46,7 @@
 
 ## Actions
 
-[Actions](https://continue.dev/docs/actions/how-to-use-it) are shortcuts for common use cases.
+[Actions](https://continue.dev/docs/actions/how-to-use-it) are shortcuts for common use cases
 
 ![actions](docs/static/img/actions.gif)
 
@@ -62,4 +62,4 @@ Check out the [contribution ideas board](https://github.com/orgs/continuedev/pro
 
 ## License
 
-[Apache 2.0 © 2023 Continue Dev, Inc.](./LICENSE)
+[Apache 2.0 © 2023-2024 Continue Dev, Inc.](./LICENSE)
